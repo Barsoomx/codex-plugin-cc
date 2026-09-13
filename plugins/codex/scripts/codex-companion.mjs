@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { parseArgs } from "./lib/args.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -24,10 +24,11 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, resolveCodexBinary } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
+  cancelJob,
   getConfig,
   listJobs,
   setConfig,
@@ -53,6 +54,8 @@ import {
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { resolveRuntimeSettings } from "./lib/runtime-settings.mjs";
+import { prepareReviewWorkspace, normalizeReviewPaths } from "./lib/review-workspace.mjs";
 import {
   renderNativeReviewResult,
   renderReviewResult,
@@ -61,29 +64,37 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  validateReviewResultShape
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
-const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
+const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
-const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+const DEFAULT_JOB_TIMEOUT_MS = 3 * 60 * 60 * 1000;
+const RUNTIME_VALUE_OPTIONS = ["model", "effort", "context-window", "auto-compact-token-limit", "turn-timeout-ms", "job-timeout-ms", "agent-timeout-seconds"];
 
 function printUsage() {
   console.log(
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--headless] [--base <ref>] [--scope <auto|working-tree|branch>] [--prompt-file <path>] [--output-file <path>] [focus]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--headless] [--base <ref>] [--scope <auto|working-tree|branch>] [focus]",
+      "  node scripts/codex-companion.mjs task [--wait|--background] [--write] [--resume <thread-id>|--resume-last|--fresh] [--prompt-file <path>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "",
+      "Tasks and reviews detach by default. --wait waits for the durable job; closing the caller does not cancel it.",
+      "Runtime flags: --model <astra|sol|luna|terra|spark|model-id> --effort <none|minimal|low|medium|high|xhigh|max|ultra>",
+      "  --context-window <tokens> --auto-compact-token-limit <tokens> --multi-agent",
+      "  --turn-timeout-ms <ms> --job-timeout-ms <ms> --agent-timeout-seconds <seconds>",
+      "Defaults: Astra / ultra, context 1000000, compaction 800000, turn/job 3 hours, agent 9600 seconds.",
+      "Use status <job-id> --wait, then result <job-id>. Help never starts a job.",
+      "Safe invocations: <subcommand> --args-file <file.json> reads a JSON array of string arguments without shell interpolation."
     ].join("\n")
   );
 }
@@ -100,46 +111,52 @@ function outputCommandResult(payload, rendered, asJson) {
   outputResult(asJson ? payload : rendered, asJson);
 }
 
-function normalizeRequestedModel(model) {
-  if (model == null) {
-    return null;
+function positiveInteger(value, fallback, flag) {
+  if (value == null) return fallback;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number <= 0 || number > 2147483647) {
+    throw new Error(`${flag} must be a positive integer no greater than 2147483647.`);
   }
-  const normalized = String(model).trim();
-  if (!normalized) {
-    return null;
-  }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
+  return number;
 }
 
-function normalizeReasoningEffort(effort) {
-  if (effort == null) {
-    return null;
-  }
-  const normalized = String(effort).trim().toLowerCase();
-  if (!normalized) {
-    return null;
-  }
-  if (!VALID_REASONING_EFFORTS.has(normalized)) {
-    throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
-    );
-  }
-  return normalized;
+function runtimeSettings(options) {
+  return resolveRuntimeSettings({
+    model: options.model,
+    effort: options.effort,
+    contextWindow: options["context-window"],
+    autoCompactTokenLimit: options["auto-compact-token-limit"],
+    turnTimeoutMs: options["turn-timeout-ms"],
+    agentTimeoutSeconds: options["agent-timeout-seconds"],
+    multiAgent: options["multi-agent"],
+    headless: options.headless
+  });
 }
 
-function normalizeArgv(argv) {
-  if (argv.length === 1) {
-    const [raw] = argv;
-    if (!raw || !raw.trim()) {
-      return [];
+function jobTimeout(options) {
+  return positiveInteger(options["job-timeout-ms"] ?? process.env.CODEX_COMPANION_JOB_TIMEOUT_MS, DEFAULT_JOB_TIMEOUT_MS, "--job-timeout-ms");
+}
+
+function validateExecutionMode(options) {
+  if (options.wait && options.background) throw new Error("Choose either --wait or --background.");
+}
+
+function readInvocationArgs(argv) {
+  if (argv[0] === "--args-file") {
+    const consume = argv.length === 3 && argv[2] === "--consume-args-file";
+    if (argv.length !== 2 && !consume) throw new Error("--args-file requires one JSON file path and optional --consume-args-file.");
+    const args = JSON.parse(fs.readFileSync(path.resolve(argv[1]), "utf8"));
+    if (!Array.isArray(args) || !args.every(arg => typeof arg === "string")) {
+      throw new Error("The arguments file must contain a JSON array of strings.");
     }
-    return splitRawArgumentString(raw);
+    if (consume) fs.unlinkSync(path.resolve(argv[1]));
+    return args;
   }
   return argv;
 }
 
 function parseCommandInput(argv, config = {}) {
-  return parseArgs(normalizeArgv(argv), {
+  return parseArgs(argv, {
     ...config,
     aliasMap: {
       C: "cwd",
@@ -201,9 +218,10 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
   return {
     ready: nodeStatus.available && codexStatus.available && authStatus.loggedIn,
-    node: nodeStatus,
+    node: { ...nodeStatus, executable: process.execPath },
     npm: npmStatus,
-    codex: codexStatus,
+    codex: { ...codexStatus, executable: resolveCodexBinary() },
+    defaults: resolveRuntimeSettings(),
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
@@ -356,20 +374,46 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
 }
 
 async function executeReviewRun(request) {
+  const target = request.target ?? resolveReviewTarget(request.cwd, { base: request.base, scope: request.scope });
+  const snapshot = request.headless ? await prepareReviewWorkspace(request.cwd, target) : null;
+  try {
+    const execution = await executeReviewInWorkspace({
+      ...request,
+      cwd: snapshot?.cwd ?? request.cwd,
+      target: snapshot?.target ?? target
+    });
+    if (snapshot) {
+      execution.rendered = normalizeReviewPaths(execution.rendered, snapshot.cwd, request.cwd);
+      execution.payload = JSON.parse(normalizeReviewPaths(JSON.stringify(execution.payload), snapshot.cwd, request.cwd));
+      if (execution.payload.context) execution.payload.context.repoRoot = ensureGitRepository(request.cwd);
+    }
+    if (request.outputFile) {
+      fs.mkdirSync(path.dirname(request.outputFile), { recursive: true });
+      fs.writeFileSync(request.outputFile, execution.rendered, "utf8");
+      execution.payload.outputFile = request.outputFile;
+    }
+    return execution;
+  } finally {
+    await snapshot?.cleanup();
+  }
+}
+
+async function executeReviewInWorkspace(request) {
   ensureCodexAvailable(request.cwd);
   ensureGitRepository(request.cwd);
 
-  const target = resolveReviewTarget(request.cwd, {
+  const target = request.target ?? resolveReviewTarget(request.cwd, {
     base: request.base,
     scope: request.scope
   });
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
-  if (reviewName === "Review") {
+  if (reviewName === "Review" && !request.headless) {
     const reviewTarget = validateNativeReviewRequest(target, focusText);
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
-      model: request.model,
+      settings: request.settings,
+      signal: request.signal,
       onProgress: request.onProgress
     });
     const payload = {
@@ -377,6 +421,8 @@ async function executeReviewRun(request) {
       target,
       threadId: result.threadId,
       sourceThreadId: result.sourceThreadId,
+      runtime: result.runtime,
+      error: result.error,
       codex: {
         status: result.status,
         stderr: result.stderr,
@@ -410,7 +456,10 @@ async function executeReviewRun(request) {
   const prompt = buildAdversarialReviewPrompt(context, focusText);
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
-    model: request.model,
+    settings: request.settings,
+    signal: request.signal,
+    reviewOnly: true,
+    headless: request.headless,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
@@ -419,10 +468,14 @@ async function executeReviewRun(request) {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
+  if (!parsed.parseError) parsed.parseError = validateReviewResultShape(parsed.parsed);
+  const exitStatus = result.status !== 0 || parsed.parseError ? 1 : 0;
   const payload = {
     review: reviewName,
     target,
     threadId: result.threadId,
+    runtime: result.runtime,
+    error: result.error ?? (parsed.parseError ? { message: `Invalid review output: ${parsed.parseError}` } : null),
     context: {
       repoRoot: context.repoRoot,
       branch: context.branch,
@@ -441,7 +494,7 @@ async function executeReviewRun(request) {
   };
 
   return {
-    exitStatus: result.status,
+    exitStatus,
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
@@ -464,11 +517,12 @@ async function executeTaskRun(request) {
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
-    resumeLast: request.resumeLast
+    resumeLast: request.resumeLast,
+    stopReview: request.stopReview
   });
 
-  let resumeThreadId = null;
-  if (request.resumeLast) {
+  let resumeThreadId = request.resumeThreadId ?? null;
+  if (!resumeThreadId && request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
     });
@@ -486,11 +540,12 @@ async function executeTaskRun(request) {
     resumeThreadId,
     prompt: request.prompt,
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
-    model: request.model,
-    effort: request.effort,
+    settings: request.settings,
+    signal: request.signal,
     sandbox: request.write ? "workspace-write" : "read-only",
+    reviewOnly: Boolean(request.stopReview),
     onProgress: request.onProgress,
-    persistThread: true,
+    persistThread: !request.stopReview,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
   });
 
@@ -511,6 +566,8 @@ async function executeTaskRun(request) {
   const payload = {
     status: result.status,
     threadId: result.threadId,
+    runtime: result.runtime,
+    error: result.error,
     rawOutput,
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
@@ -537,9 +594,10 @@ function buildReviewJobMetadata(reviewName, target) {
   };
 }
 
-function buildTaskRunMetadata({ prompt, resumeLast = false }) {
-  if (!resumeLast && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
+function buildTaskRunMetadata({ prompt, resumeLast = false, stopReview = false }) {
+  if (stopReview) {
     return {
+      stopReview: true,
       title: "Codex Stop Gate Review",
       summary: "Stop-gate review of previous Claude turn"
     };
@@ -554,7 +612,7 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 }
 
 function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
+  return `${payload.title} started in the background as ${payload.jobId}.\nWait: /codex:status ${payload.jobId} --wait\nResult: /codex:result ${payload.jobId}\nLog: ${payload.logFile}\n`;
 }
 
 function getJobKindLabel(kind, jobClass) {
@@ -591,25 +649,27 @@ function createTrackedProgress(job, options = {}) {
 
 function buildTaskJob(workspaceRoot, taskMetadata, write) {
   return createCompanionJob({
-    prefix: "task",
-    kind: "task",
+    prefix: taskMetadata.stopReview ? "review" : "task",
+    kind: taskMetadata.stopReview ? "stop-review" : "task",
     title: taskMetadata.title,
     workspaceRoot,
-    jobClass: "task",
+    jobClass: taskMetadata.stopReview ? "review" : "task",
     summary: taskMetadata.summary,
     write
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, settings, prompt, write, resumeLast, resumeThreadId, jobId, jobTimeoutMs, stopReview }) {
   return {
     cwd,
-    model,
-    effort,
+    settings,
     prompt,
     write,
     resumeLast,
-    jobId
+    resumeThreadId,
+    jobId,
+    jobTimeoutMs,
+    stopReview
   };
 }
 
@@ -655,17 +715,27 @@ function requireTaskRequest(prompt, resumeLast) {
   }
 }
 
-async function runForegroundCommand(job, runner, options = {}) {
-  const { logFile, progress } = createTrackedProgress(job, {
-    logFile: options.logFile,
-    stderr: !options.json
-  });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
-  outputResult(options.json ? execution.payload : execution.rendered, options.json);
-  if (execution.exitStatus !== 0) {
-    process.exitCode = execution.exitStatus;
+async function dispatchJob(cwd, job, request, options = {}) {
+  ensureCodexAvailable(cwd);
+  const { payload } = enqueueBackgroundTask(cwd, job, request);
+  if (!options.wait) {
+    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    return;
   }
-  return execution;
+  if (!options.json) process.stderr.write(`[codex] Waiting for ${job.id}. The job continues if this caller exits.\n`);
+  const snapshot = await waitForSingleJobSnapshot(cwd, job.id, {
+    timeoutMs: request.jobTimeoutMs + 15000,
+    pollIntervalMs: 200
+  });
+  if (snapshot.waitTimedOut) {
+    outputCommandResult({ ...payload, ...snapshot }, `${renderQueuedTaskLaunch(payload)}Waiting ended while the job was still active.\n`, options.json);
+    process.exitCode = 1;
+    return;
+  }
+  const stored = readStoredJob(job.workspaceRoot, job.id);
+  const result = stored?.result ?? { status: 1, error: { message: stored?.errorMessage ?? "Codex job failed before producing a result." } };
+  outputCommandResult(result, renderStoredJobResult(stored ?? job, stored), options.json);
+  if (stored?.status !== "completed") process.exitCode = 1;
 }
 
 function spawnDetachedTaskWorker(cwd, jobId) {
@@ -685,17 +755,27 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
+    detached: true,
+    dispatchPid: process.pid,
+    cancelViaState: true,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+  // Publish the request before starting the worker; only the worker writes its PID.
+  // Updating it here after spawn can overwrite a fast worker's terminal state.
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  child.on("error", (error) => {
+    const failed = { ...queuedRecord, status: "failed", phase: "failed", errorMessage: error.message, completedAt: nowIso() };
+    writeJobFile(job.workspaceRoot, job.id, failed);
+    upsertJob(job.workspaceRoot, failed);
+  });
 
   return {
     payload: {
@@ -711,8 +791,9 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
-    booleanOptions: ["json", "background", "wait"],
+    valueOptions: ["base", "scope", "cwd", "prompt-file", "output-file", ...RUNTIME_VALUE_OPTIONS],
+    booleanOptions: ["json", "background", "wait", "headless", "multi-agent"],
+    rejectUnknownOptions: true,
     aliasMap: {
       m: "model"
     }
@@ -720,13 +801,15 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const focusText = positionals.join(" ").trim();
+  validateExecutionMode(options);
+  const settings = runtimeSettings(options);
+  const focusText = options["prompt-file"] ? fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8") : positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
     scope: options.scope
   });
 
-  config.validateRequest?.(target, focusText);
+  if (!options.headless) config.validateRequest?.(target, focusText);
   const metadata = buildReviewJobMetadata(config.reviewName, target);
   const job = createCompanionJob({
     prefix: "review",
@@ -736,20 +819,15 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: options.model,
-        focusText,
-        reviewName: config.reviewName,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  const request = {
+    kind: "review", cwd, target,
+    settings, focusText,
+    headless: Boolean(options.headless),
+    outputFile: options["output-file"] ? path.resolve(cwd, options["output-file"]) : null,
+    reviewName: config.reviewName,
+    jobTimeoutMs: jobTimeout(options)
+  };
+  await dispatchJob(cwd, job, request, options);
 }
 
 async function handleReview(argv) {
@@ -761,8 +839,9 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["cwd", "prompt-file", "resume", ...RUNTIME_VALUE_OPTIONS],
+    booleanOptions: ["json", "write", "resume-last", "fresh", "background", "wait", "multi-agent", "stop-review"],
+    rejectUnknownOptions: true,
     aliasMap: {
       m: "model"
     }
@@ -770,56 +849,29 @@ async function handleTask(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  validateExecutionMode(options);
+  const settings = runtimeSettings(options);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
-  const resumeLast = Boolean(options["resume-last"] || options.resume);
+  const resumeLast = Boolean(options["resume-last"]);
+  const resumeThreadId = options.resume ?? null;
   const fresh = Boolean(options.fresh);
-  if (resumeLast && fresh) {
-    throw new Error("Choose either --resume/--resume-last or --fresh.");
+  if ([resumeLast, Boolean(resumeThreadId), fresh].filter(Boolean).length > 1) {
+    throw new Error("Choose only one of --resume <thread-id>, --resume-last, or --fresh.");
   }
   const write = Boolean(options.write);
+  const stopReview = Boolean(options["stop-review"]);
+  if (stopReview && (write || resumeLast || resumeThreadId)) throw new Error("Stop reviews must be fresh and read-only.");
   const taskMetadata = buildTaskRunMetadata({
     prompt,
-    resumeLast
+    resumeLast: resumeLast || Boolean(resumeThreadId),
+    stopReview
   });
 
-  if (options.background) {
-    ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
-
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-    const request = buildTaskRequest({
-      cwd,
-      model,
-      effort,
-      prompt,
-      write,
-      resumeLast,
-      jobId: job.id
-    });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
-    return;
-  }
-
+  requireTaskRequest(prompt, resumeLast || Boolean(resumeThreadId));
   const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  const request = buildTaskRequest({ cwd, settings, prompt, write, resumeLast, resumeThreadId, jobId: job.id, jobTimeoutMs: jobTimeout(options), stopReview });
+  await dispatchJob(cwd, job, request, options);
 }
 
 async function handleTransfer(argv) {
@@ -855,6 +907,22 @@ async function handleTaskWorker(argv) {
   if (!request || typeof request !== "object") {
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
   }
+  if (storedJob.status !== "queued") return;
+  const controller = new AbortController();
+  const abortWorker = () => controller.abort(new Error("Codex worker was interrupted."));
+  process.once("SIGTERM", abortWorker);
+  process.once("SIGINT", abortWorker);
+  const timer = setTimeout(() => controller.abort(new Error(`Codex job exceeded its ${request.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS} ms deadline.`)), request.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS);
+  const cancellationPoll = setInterval(() => {
+    try {
+      if (readStoredJob(workspaceRoot, storedJob.id)?.status === "cancelled") {
+        controller.abort(new Error("Cancelled by user."));
+      }
+    } catch (error) {
+      controller.abort(error);
+    }
+  }, 250);
+  let workerOwned = false;
 
   const { logFile, progress } = createTrackedProgress(
     {
@@ -865,19 +933,30 @@ async function handleTaskWorker(argv) {
       logFile: storedJob.logFile ?? null
     }
   );
-  await runTrackedJob(
+  try {
+    await runTrackedJob(
     {
       ...storedJob,
       workspaceRoot,
       logFile
     },
-    () =>
-      executeTaskRun({
+    () => {
+      workerOwned = true;
+      return (request.kind === "review" ? executeReviewRun : executeTaskRun)({
         ...request,
+        signal: controller.signal,
         onProgress: progress
-      }),
+      });
+    },
     { logFile }
-  );
+    );
+  } finally {
+    clearTimeout(timer);
+    clearInterval(cancellationPoll);
+    process.removeListener("SIGTERM", abortWorker);
+    process.removeListener("SIGINT", abortWorker);
+    if (workerOwned) upsertJob(workspaceRoot, { id: storedJob.id, workerStoppedAt: nowIso() });
+  }
 }
 
 async function handleStatus(argv) {
@@ -969,11 +1048,34 @@ async function handleCancel(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
-  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
-
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  // The same per-job lock protects worker claims. Cancel-first blocks the
+  // runner; claim-first lets the owned worker observe the cancellation record.
+  const cancelled = cancelJob(workspaceRoot, job.id);
+  const previous = cancelled.previous ?? job;
+  const nextJob = cancelled.job ?? job;
+  if (!cancelled.changed) {
+    outputCommandResult({ jobId: job.id, status: nextJob.status, title: nextJob.title }, `Job ${job.id} is already ${nextJob.status}.\n`, options.json);
+    return;
+  }
+  const threadId = previous.threadId ?? null;
+  const turnId = previous.turnId ?? null;
+  // Current workers observe the cancelled record and interrupt their own app-server.
+  // No numeric PID is used as permission to signal an unrelated OS process. Legacy
+  // records without a live worker can still have a turn in a shared broker.
+  const interrupt = previous.cancelViaState
+    ? { attempted: false, interrupted: false }
+    : await interruptAppServerTurn(previous.request?.cwd ?? workspaceRoot, { threadId, turnId });
+  let workerStopped = !previous.pid;
+  if (previous.cancelViaState && previous.pid) {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (readStoredJob(workspaceRoot, job.id)?.workerStoppedAt) {
+        workerStopped = true;
+        break;
+      }
+      await sleep(100);
+    }
+  }
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -983,37 +1085,14 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
-
-  const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
 
   const payload = {
     jobId: job.id,
     status: "cancelled",
     title: job.title,
+    cancellationRequested: true,
+    workerStopped,
     turnInterruptAttempted: interrupt.attempted,
     turnInterrupted: interrupt.interrupted
   };
@@ -1022,8 +1101,11 @@ async function handleCancel(argv) {
 }
 
 async function main() {
-  const [subcommand, ...argv] = process.argv.slice(2);
-  if (!subcommand || subcommand === "help" || subcommand === "--help") {
+  const [subcommand, ...rawArgv] = process.argv.slice(2);
+  const argv = readInvocationArgs(rawArgv);
+  const optionEnd = argv.indexOf("--");
+  const optionArgs = optionEnd < 0 ? argv : argv.slice(0, optionEnd);
+  if (!subcommand || subcommand === "help" || subcommand === "--help" || subcommand === "-h" || optionArgs.some(arg => arg === "--help" || arg === "-h")) {
     printUsage();
     return;
   }

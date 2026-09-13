@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { claimQueuedJob, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -16,6 +16,7 @@ function normalizeProgressEvent(value) {
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
       threadId: typeof value.threadId === "string" && value.threadId.trim() ? value.threadId.trim() : null,
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
+      runtime: value.runtime && typeof value.runtime === "object" && !Array.isArray(value.runtime) ? value.runtime : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
       logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
@@ -27,6 +28,7 @@ function normalizeProgressEvent(value) {
     phase: null,
     threadId: null,
     turnId: null,
+    runtime: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
     logBody: null
@@ -95,22 +97,16 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       changed = true;
     }
 
+    if (normalized.runtime) {
+      patch.runtime = normalized.runtime;
+      changed = true;
+    }
+
     if (!changed) {
       return;
     }
 
     upsertJob(workspaceRoot, patch);
-
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
-    }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
   };
 }
 
@@ -140,64 +136,80 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
+  const claimed = claimQueuedJob(job.workspaceRoot, job.id, process.pid);
+  if (!claimed) {
+    return null;
+  }
+
+  const requestedSettings = claimed.request?.settings;
+  const requestedRuntime =
+    requestedSettings && typeof requestedSettings === "object"
+      ? {
+          source: "requested",
+          model: null,
+          reasoningEffort: null,
+          contextWindow: null,
+          configuredModel: requestedSettings.model ?? null,
+          configuredReasoningEffort: requestedSettings.effort ?? null,
+          configuredContextWindow: requestedSettings.contextWindow ?? null
+        }
+      : null;
   const runningRecord = {
-    ...job,
-    status: "running",
-    startedAt: nowIso(),
-    phase: "starting",
-    pid: process.pid,
-    logFile: options.logFile ?? job.logFile ?? null
+    ...claimed,
+    logFile: options.logFile ?? claimed.logFile ?? null,
+    ...(claimed.runtime ? { runtime: claimed.runtime } : requestedRuntime ? { runtime: requestedRuntime } : {})
   };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
 
   try {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
+    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+    const status = existing.status === "cancelled" ? "cancelled" : completionStatus;
+    const payloadError = execution.payload?.error;
+    const errorMessage =
+      status === "failed"
+        ? typeof payloadError === "string"
+          ? payloadError
+          : payloadError?.message ??
+            (payloadError && typeof payloadError === "object" ? JSON.stringify(payloadError) : null) ??
+            execution.errorMessage ??
+            execution.error?.message ??
+            (typeof execution.rendered === "string" && execution.rendered.trim() ? execution.rendered.trim() : null) ??
+            null
+        : existing.errorMessage ?? null;
+    const terminalPatch = {
+      id: job.id,
+      status,
+      phase: status === "completed" ? "done" : status === "cancelled" ? "cancelled" : "failed",
       pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
       result: execution.payload,
-      rendered: execution.rendered
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
-    });
+      rendered: execution.rendered,
+      ...(execution.threadId ? { threadId: execution.threadId } : {}),
+      ...(execution.turnId ? { turnId: execution.turnId } : {}),
+      ...(execution.summary ? { summary: execution.summary } : {}),
+      ...(errorMessage ? { errorMessage } : {}),
+      ...(execution.payload?.runtime ? { runtime: execution.payload.runtime } : {})
+    };
+    upsertJob(job.workspaceRoot, terminalPatch);
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
+    const status = existing.status === "cancelled" ? "cancelled" : "failed";
+    const terminalErrorMessage = status === "cancelled" ? existing.errorMessage ?? "Cancelled by user." : errorMessage;
     upsertJob(job.workspaceRoot, {
       id: job.id,
-      status: "failed",
-      phase: "failed",
+      status,
+      phase: status === "cancelled" ? "cancelled" : "failed",
       pid: null,
-      errorMessage,
-      completedAt
+      errorMessage: terminalErrorMessage,
+      completedAt,
+      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
     });
     throw error;
   }

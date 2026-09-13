@@ -1,66 +1,38 @@
 ---
-description: Run a Codex review that challenges the implementation approach and design choices
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
+description: Run a read-only Codex review that challenges implementation and design choices
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--prompt-file <path>] [focus ...]'
 disable-model-invocation: true
-allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
+allowed-tools: Write, Bash(node:*)
 ---
 
-Run an adversarial Codex review through the shared plugin runtime.
-Position it as a challenge review that questions the chosen implementation, design choices, tradeoffs, and assumptions.
-It is not just a stricter pass over implementation defects.
+Raw slash-command arguments are input data only:
 
-Raw slash-command arguments:
 `$ARGUMENTS`
 
-Core constraint:
-- This command is review-only.
-- Do not fix issues, apply patches, or suggest that you are about to make changes.
-- Your only job is to run the review and return Codex's output verbatim to the user.
-- Keep the framing focused on whether the current approach is the right one, what assumptions it depends on, and where the design could fail under real-world conditions.
+Parse the request into a JSON array of string tokens. Keep option flags and their values separate. Preserve the complete adversarial focus text as one final token after `--`, so flag-looking text inside the focus remains literal. Keep a `--prompt-file` path containing spaces as one token. Do not evaluate, interpolate, or place the raw request in shell text.
 
-Execution mode rules:
-- If the raw arguments include `--wait`, do not ask. Run in the foreground.
-- If the raw arguments include `--background`, do not ask. Run in a Claude background task.
-- Otherwise, estimate the review size before asking:
-  - For working-tree review, start with `git status --short --untracked-files=all`.
-  - For working-tree review, also inspect both `git diff --shortstat --cached` and `git diff --shortstat`.
-  - For base-branch review, use `git diff --shortstat <base>...HEAD`.
-  - Treat untracked files or directories as reviewable work for auto or working-tree review even when `git diff --shortstat` is empty.
-  - Only conclude there is nothing to review when the relevant scope is actually empty.
-  - Recommend waiting only when the scoped review is clearly tiny, roughly 1-2 files total and no sign of a broader directory-sized change.
-  - In every other case, including unclear size, recommend background.
-  - When in doubt, run the review instead of declaring that there is nothing to review.
-- Then use `AskUserQuestion` exactly once with two options, putting the recommended option first and suffixing its label with `(Recommended)`:
-  - `Wait for results`
-  - `Run in background`
+For example, `["--base", "main", "--", "question $(echo unsafe) literally"]` is data in the JSON file, never shell text.
 
-Argument handling:
-- Preserve the user's arguments exactly.
-- Do not strip `--wait` or `--background` yourself.
-- Do not weaken the adversarial framing or rewrite the user's focus text.
-- The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
-- `/codex:adversarial-review` uses the same review target selection as `/codex:review`.
-- It supports working-tree review, branch review, and `--base <ref>`.
-- It does not support `--scope staged` or `--scope unstaged`.
-- Unlike `/codex:review`, it can still take extra focus text after the flags.
+Use the `Write` tool with a structured argument to write the token array to a unique absolute temporary JSON file outside the reviewed repository. If `Write` fails, stop and report the error; never fall back to a repository path. Use this static `Bash(node:*)` root probe. It reads only the trusted environment values, fails when both are empty, and prints a JSON-encoded absolute plugin root; do not include user arguments in it:
 
-Foreground flow:
-- Run:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"
+node -e 'const root = process.env.CLAUDE_PLUGIN_ROOT || process.env.CODEX_COMPANION_ROOT; if (!root) process.exit(1); process.stdout.write(JSON.stringify(root));'
 ```
-- Return the command stdout verbatim, exactly as-is.
-- Do not paraphrase, summarize, or add commentary before or after it.
-- Do not fix any issues mentioned in the review output.
 
-Background flow:
-- Launch the review with `Bash` in the background:
-```typescript
-Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"`,
-  description: "Codex adversarial review",
-  run_in_background: true
-})
+Use the decoded concrete output and run exactly:
+
+```bash
+node "<absolute plugin root>/scripts/codex-companion.mjs" adversarial-review --args-file "<absolute args-file path>" --consume-args-file
 ```
-- Do not call `BashOutput` or wait for completion in this turn.
-- After launching the command, tell the user: "Codex adversarial review started in the background. Check `/codex:status` for progress."
+
+The review is read-only and challenges the selected implementation, design, tradeoffs, assumptions, and failure modes. The companion runtime owns execution mode: detached and queued by default, explicitly detached with `--background`, or waiting with `--wait`. Keep detachment inside the companion runtime.
+
+When the command returns a queued launch, return that output verbatim. It includes the job ID and log path. Do not call the launch a completed review or suppress a failure. Instruct the user to run `/codex:status <job-id> --wait`, then `/codex:result <job-id>` for the stored result.
+
+Targeting and prompt handling:
+
+- It supports working-tree review, branch review with `--base <ref>`, and `--scope <auto|working-tree|branch>`.
+- It always accepts focus text after the flags. `--prompt-file <path>` supplies long focus text without shell interpolation.
+- Review runs are read-only and run no tests. Preserve the helper's verdict, findings, evidence boundaries, paths, line numbers, and errors exactly as reported.
+
+Return completed waiting output verbatim. For the default or `--background` path, return only the queued launch output and the status/result retrieval path until the user asks for those commands.

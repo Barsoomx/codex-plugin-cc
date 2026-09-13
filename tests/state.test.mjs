@@ -5,7 +5,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  getConfig,
+  resolveConfigFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  setConfig,
+  upsertJob
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +112,19 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("authoritative config survives a stale secondary state index write", () => {
+  const workspace = makeTempDir();
+  upsertJob(workspace, { id: "job-config-race", status: "queued" });
+
+  const stateFile = resolveStateFile(workspace);
+  const staleSecondaryState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  setConfig(workspace, "stopReviewGate", true);
+
+  staleSecondaryState.config.stopReviewGate = false;
+  fs.writeFileSync(stateFile, `${JSON.stringify(staleSecondaryState, null, 2)}\n`, "utf8");
+
+  assert.equal(JSON.parse(fs.readFileSync(resolveConfigFile(workspace), "utf8")).stopReviewGate, true);
+  assert.equal(getConfig(workspace).stopReviewGate, true);
 });

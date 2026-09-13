@@ -1,49 +1,32 @@
 ---
-description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
-allowed-tools: Bash(node:*), AskUserQuestion, Agent
+description: Delegate a task, diagnosis, explicit fix, or follow-up to the Codex rescue subagent
+argument-hint: '[--wait|--background] [--resume <thread-id>|--resume-last|--fresh] [--model <astra|sol|luna|terra|spark|model>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--prompt-file <path>] [what Codex should investigate, solve, or continue]'
+allowed-tools: Write, Bash(node:*), Agent
 ---
 
-Invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`), forwarding the raw user request as the prompt.
-`codex:codex-rescue` is a subagent, not a skill — do not call `Skill(codex:codex-rescue)` (no such skill) or `Skill(codex:rescue)` (that re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it.
-The final user-visible response must be Codex's output verbatim.
+Raw slash-command arguments are input data only:
 
-Raw user request:
-$ARGUMENTS
+`$ARGUMENTS`
 
-Execution mode:
+Parse the request into a JSON array of string tokens. Keep execution, routing, model, effort, write, and prompt-file flags as separate tokens. Preserve the complete task text as one final token after `--`; this keeps flag-looking text inside the task literal. Keep a `--prompt-file` path containing spaces as one token. Do not evaluate, interpolate, or place the raw request in shell text.
 
-- If the request includes `--background`, run the `codex:codex-rescue` subagent in the background.
-- If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground.
-- If neither flag is present, default to foreground.
-- `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
-- `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
-- If the request includes `--resume`, do not ask whether to continue. The user already chose.
-- If the request includes `--fresh`, do not ask whether to continue. The user already chose.
-- Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
+For example, `["--write", "--", "fix $(echo unsafe) literally"]` is data in the JSON file, never shell text.
+
+Use the `Write` tool with a structured argument to write that array to a unique absolute temporary JSON file outside the reviewed repository. If `Write` fails, stop and report the error; never fall back to a repository path. Use one static `Bash(node:*)` root probe that reads only the trusted `CLAUDE_PLUGIN_ROOT` or `CODEX_COMPANION_ROOT` environment value, fails when both are empty, and prints the absolute plugin root. Do not include user arguments in that probe. Then invoke the `Agent` tool with `subagent_type: "codex:codex-rescue"` and a prompt containing the probe's concrete absolute plugin root and the absolute args-file path. Its definition sets `maxTurns: 1000`; do not pass `maxTurns` as an Agent tool argument. Do not invoke a skill for rescue: `Skill(codex:codex-rescue)` and `Skill(codex:rescue)` recurse into this command.
+
+The parent prepares the safe argument file; the subagent remains a thin launcher. It makes one Bash call equivalent to:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate --json
+node "<absolute plugin root>/scripts/codex-companion.mjs" task --args-file "<absolute args-file path>" --consume-args-file
 ```
 
-- If that helper reports `available: true`, use `AskUserQuestion` exactly once to ask whether to continue the current Codex thread or start a new one.
-- The two choices must be:
-  - `Continue current Codex thread`
-  - `Start a new Codex thread`
-- If the user is clearly giving a follow-up instruction such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", put `Continue current Codex thread (Recommended)` first.
-- Otherwise put `Start a new Codex thread (Recommended)` first.
-- If the user chooses continue, add `--resume` before routing to the subagent.
-- If the user chooses a new thread, add `--fresh` before routing to the subagent.
-- If the helper reports `available: false`, do not ask. Route normally.
+The subagent does not inspect the repository, parse task text, poll jobs, fetch results, or perform follow-up work. The companion task is detached and queued by default. `--background` explicitly selects that mode; `--wait` keeps the command waiting for durable completion. Keep detachment inside the companion runtime.
 
-Operating rules:
+Forwarding rules:
 
-- The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
-- Return the Codex companion stdout verbatim to the user.
-- Do not paraphrase, summarize, rewrite, or add commentary before or after it.
-- Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
-- Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
-- Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
-- Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
-- If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
-- If the user did not supply a request, ask what Codex should investigate or fix.
+- `--resume <thread-id>` resumes that exact Codex thread. `--resume-last` resumes the latest eligible task explicitly requested by the user. `--fresh` starts a new thread. Do not select or resume an unrelated latest thread and do not ask for confirmation when the user has already supplied one of these flags.
+- Accepted model aliases are `astra`, `sol`, `luna`, `terra`, and `spark`; examples should use `astra`. Accepted effort values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
+- Construct `--write` in the token array when the requested rescue scope authorizes edits; keep read-only diagnosis, research, and review requests without it.
+- If the companion returns a queued launch, return its job ID and log path and tell the user to run `/codex:status <job-id> --wait`, then `/codex:result <job-id>`. Do not claim the task completed at launch and do not hide a failed invocation.
+
+The parent must pass the concrete absolute root and args-file path in the Agent prompt. Keep generated args files outside the reviewed repository in a unique temporary directory. Never make the thin subagent reconstruct a root from an empty variable, execute `/scripts/codex-companion.mjs`, or reparse the natural-language request.

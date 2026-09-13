@@ -21,7 +21,7 @@ function formatLineRange(finding) {
   return `:${finding.line_start}-${finding.line_end}`;
 }
 
-function validateReviewResultShape(data) {
+export function validateReviewResultShape(data) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     return "Expected a top-level JSON object.";
   }
@@ -36,6 +36,20 @@ function validateReviewResultShape(data) {
   }
   if (!Array.isArray(data.next_steps)) {
     return "Missing array `next_steps`.";
+  }
+  if (Object.keys(data).some(key => !["verdict", "summary", "findings", "next_steps"].includes(key))) return "Unexpected top-level review field.";
+  if (!["approve", "needs-attention"].includes(data.verdict)) return "Unknown review verdict.";
+  if (data.next_steps.some(step => typeof step !== "string" || !step.trim())) return "Each next step must be a nonempty string.";
+  const keys = ["severity", "title", "body", "file", "line_start", "line_end", "confidence", "recommendation"];
+  for (const [index, finding] of data.findings.entries()) {
+    const invalid = reason => `Finding ${index + 1}: ${reason}`;
+    if (!finding || typeof finding !== "object" || Array.isArray(finding)) return invalid("expected an object.");
+    if (keys.some(key => !Object.hasOwn(finding, key)) || Object.keys(finding).some(key => !keys.includes(key))) return invalid("fields do not match the review schema.");
+    if (!["critical", "high", "medium", "low"].includes(finding.severity)) return invalid("unknown severity.");
+    if (["title", "body", "file"].some(key => typeof finding[key] !== "string" || !finding[key].trim())) return invalid("title, body and file must be nonempty strings.");
+    if (typeof finding.recommendation !== "string") return invalid("recommendation must be a string.");
+    if (![finding.line_start, finding.line_end].every(line => Number.isSafeInteger(line) && line > 0) || finding.line_end < finding.line_start) return invalid("invalid source line range.");
+    if (typeof finding.confidence !== "number" || !Number.isFinite(finding.confidence) || finding.confidence < 0 || finding.confidence > 1) return invalid("confidence must be between 0 and 1.");
   }
   return null;
 }
@@ -106,6 +120,27 @@ function formatCodexResumeCommand(job) {
   return `codex resume ${job.threadId}`;
 }
 
+function formatRuntime(runtime) {
+  if (!runtime || typeof runtime !== "object") {
+    return null;
+  }
+  const requested = runtime.source === "requested";
+  const model = runtime.model ?? runtime.modelId ?? runtime.modelName ?? runtime.configuredModel;
+  const effort = runtime.effort ?? runtime.reasoningEffort ?? runtime.configuredReasoningEffort;
+  const context = runtime.context ?? runtime.contextWindow ?? runtime.contextWindowTokens ?? runtime.configuredContextWindow;
+  const parts = [];
+  if (model) {
+    parts.push(`model=${model}`);
+  }
+  if (effort) {
+    parts.push(`effort=${effort}`);
+  }
+  if (context) {
+    parts.push(`context=${context}`);
+  }
+  return parts.length > 0 ? `${requested ? "requested " : ""}${parts.join(", ")}` : null;
+}
+
 function appendActiveJobsTable(lines, jobs) {
   lines.push("Active jobs:");
   lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
@@ -137,6 +172,10 @@ function pushJobDetails(lines, job, options = {}) {
   }
   if (job.threadId) {
     lines.push(`  Codex session ID: ${job.threadId}`);
+  }
+  const runtime = formatRuntime(job.runtime ?? job.result?.runtime);
+  if (runtime) {
+    lines.push(`  Runtime: ${runtime}`);
   }
   const resumeCommand = formatCodexResumeCommand(job);
   if (resumeCommand) {

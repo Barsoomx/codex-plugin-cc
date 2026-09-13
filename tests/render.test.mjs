@@ -3,16 +3,18 @@ import assert from "node:assert/strict";
 
 import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
 
-test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
+test("renderReviewResult rejects incomplete review JSON instead of normalizing it", () => {
   const output = renderReviewResult(
     {
       parsed: {
         verdict: "approve",
-        summary: "Looks fine."
+        summary: "Looks fine.",
+        findings: null,
       },
       rawOutput: JSON.stringify({
         verdict: "approve",
-        summary: "Looks fine."
+        summary: "Looks fine.",
+        findings: null
       }),
       parseError: null
     },
@@ -25,6 +27,29 @@ test("renderReviewResult degrades gracefully when JSON is missing required revie
   assert.match(output, /Codex returned JSON with an unexpected review shape\./);
   assert.match(output, /Missing array `findings`\./);
   assert.match(output, /Raw final message:/);
+});
+
+test("renderReviewResult rejects unknown verdicts and extra top-level fields", () => {
+  const output = renderReviewResult(
+    {
+      parsed: {
+        verdict: "maybe",
+        summary: "Looks fine.",
+        findings: [],
+        next_steps: [],
+        extra: true
+      },
+      rawOutput: '{"verdict":"maybe","summary":"Looks fine.","findings":[],"next_steps":[],"extra":true}',
+      parseError: null
+    },
+    {
+      reviewLabel: "Adversarial Review",
+      targetLabel: "working tree diff"
+    }
+  );
+
+  assert.match(output, /unexpected review shape/);
+  assert.match(output, /Unexpected top-level review field/);
 });
 
 test("renderStoredJobResult prefers rendered output for structured review jobs", () => {

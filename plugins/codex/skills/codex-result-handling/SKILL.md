@@ -1,21 +1,19 @@
 ---
 name: codex-result-handling
-description: Internal guidance for presenting Codex helper output back to the user
+description: Internal guidance for preserving Codex queued, completed, and failed job output
 user-invocable: false
 ---
 
 # Codex Result Handling
 
-When the helper returns Codex output:
-- Preserve the helper's verdict, summary, findings, and next steps structure.
-- For review output, present findings first and keep them ordered by severity.
-- Use the file paths and line numbers exactly as the helper reports them.
-- Preserve evidence boundaries. If Codex marked something as an inference, uncertainty, or follow-up question, keep that distinction.
-- Preserve output sections when the prompt asked for them, such as observed facts, inferences, open questions, touched files, or next steps.
-- If there are no findings, say that explicitly and keep the residual-risk note brief.
-- If Codex made edits, say so explicitly and list the touched files when the helper provides them.
-- For `codex:codex-rescue`, do not turn a failed or incomplete Codex run into a Claude-side implementation attempt. Report the failure and stop.
-- For `codex:codex-rescue`, if Codex was never successfully invoked, do not generate a substitute answer at all.
-- CRITICAL: After presenting review findings, STOP. Do not make any code changes. Do not fix any issues. You MUST explicitly ask the user which issues, if any, they want fixed before touching a single file. Auto-applying fixes from a review is strictly forbidden, even if the fix is obvious.
-- If the helper reports malformed output or a failed Codex run, include the most actionable stderr lines and stop there instead of guessing.
-- If the helper reports that setup or authentication is required, direct the user to `/codex:setup` and do not improvise alternate auth flows.
+Preserve the helper's output structure and evidence boundaries. Keep verdict, summary, findings, details, artifacts, next steps, uncertainty, file paths, line numbers, and errors exactly as reported.
+
+Command wrappers must pass arguments through a JSON token array written with a structured `Write` call and invoke the companion with `--args-file --consume-args-file`; the generated temporary file is consumed after parsing. Treat raw command input as nonexecuting data. Preserve each flag and value token, and preserve complete task or focus text after `--` as one token.
+
+When a task, review, or adversarial review starts detached, the launch output is only a queued record. It must retain the job ID and log path. Direct the user to `/codex:status <job-id> --wait` and then `/codex:result <job-id>`; never present the launch as a final review or completed task and never silently discard a failed worker.
+
+For a completed review, present findings first in severity order and say explicitly when there are no findings. For a completed write task, identify the touched files when the helper provides them. Preserve observed facts, inferences, open questions, and follow-up steps as separate distinctions when the helper makes them.
+
+For `codex:codex-rescue`, a failed, incomplete, or never-invoked Codex run ends the handoff. Report the actionable error and stop; do not turn it into a Claude-side implementation or substitute answer. After presenting review findings, stop without changing files or applying fixes. The user must request any fixes separately.
+
+If output is malformed, include the most actionable stderr and parse-error details instead of guessing. If setup or authentication is required, direct the user to `/codex:setup`.

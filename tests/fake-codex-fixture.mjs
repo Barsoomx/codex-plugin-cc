@@ -19,7 +19,17 @@ const readline = require("node:readline");
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
-	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], capabilities: null, lastInterrupt: null };
+	    return {
+	      nextThreadId: 1,
+	      nextTurnId: 1,
+	      appServerStarts: 0,
+	      threads: [],
+	      capabilities: null,
+	      lastInterrupt: null,
+	      lastThreadStart: null,
+	      lastThreadResume: null,
+	      lastTurnStart: null
+	    };
 	  }
 	  return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
 	}
@@ -233,7 +243,7 @@ function structuredReviewPayload(prompt) {
 }
 
 function taskPayload(prompt, resume) {
-  if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
+  if (prompt.includes("<task>") && prompt.includes("Run a stop-gate review of the previous Claude turn.")) {
     if (BEHAVIOR === "adversarial-clean") {
       return "ALLOW: No blocking issues found in the previous turn.";
     }
@@ -313,7 +323,19 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        state.lastThreadStart = {
+          threadId: thread.id,
+          cwd: message.params.cwd,
+          model: message.params.model ?? null,
+          ephemeral: Boolean(message.params.ephemeral),
+          sandbox: message.params.sandbox ?? null,
+          config: message.params.config ?? null,
+          developerInstructions: message.params.developerInstructions ?? null,
+          persistExtendedHistory: message.params.persistExtendedHistory ?? null,
+          persistFullHistory: message.params.persistFullHistory ?? null
+        };
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: message.params.config?.model_reasoning_effort ?? null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -340,14 +362,31 @@ rl.on("line", (line) => {
         break;
       }
 
+      case "thread/read":
+      case "thread/get": {
+        const thread = ensureThread(state, message.params.threadId);
+        send({ id: message.id, result: { thread: buildThread(thread) } });
+        break;
+      }
+
       case "thread/resume": {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        state.lastThreadResume = {
+          threadId: message.params.threadId,
+          cwd: message.params.cwd,
+          model: message.params.model ?? null,
+          sandbox: message.params.sandbox ?? null,
+          config: message.params.config ?? null,
+          developerInstructions: message.params.developerInstructions ?? null,
+          persistExtendedHistory: message.params.persistExtendedHistory ?? null,
+          persistFullHistory: message.params.persistFullHistory ?? null
+        };
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: message.params.config?.model_reasoning_effort ?? null } });
         break;
       }
 
@@ -459,9 +498,10 @@ rl.on("line", (line) => {
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
 
         if (
-          BEHAVIOR === "with-subagent" ||
-          BEHAVIOR === "with-late-subagent-message" ||
-          BEHAVIOR === "with-subagent-no-main-turn-completed"
+          (message.params.config?.features?.multi_agent === true ||
+            state.lastThreadStart?.config?.features?.multi_agent === true ||
+            state.lastThreadResume?.config?.features?.multi_agent === true) &&
+          ["with-subagent", "with-late-subagent-message", "with-subagent-no-main-turn-completed"].includes(BEHAVIOR)
         ) {
           const subThread = nextThread(state, thread.cwd, true);
           const subThreadRecord = ensureThread(state, subThread.id);
@@ -653,6 +693,10 @@ export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`,
+    CODEX_COMPANION_CODEX_BIN: path.join(
+      binDir,
+      process.platform === "win32" ? "codex.cmd" : "codex"
+    )
   };
 }

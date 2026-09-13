@@ -6,6 +6,7 @@
  * @typedef {import("./app-server-protocol").ThreadStartParams} ThreadStartParams
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
+ * @typedef {import("./app-server-protocol").AppServerResponse<"turn/start"> | import("./app-server-protocol").AppServerResponse<"review/start">} CaptureStartResponse
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
  * @typedef {{
  *   threadId: string,
@@ -24,9 +25,12 @@
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
+ *   turnTimeoutTimer: ReturnType<typeof setTimeout> | null,
  *   lastAgentMessage: string,
  *   reviewText: string,
  *   reasoningSummary: string[],
+ *   tokenUsage: object | null,
+ *   modelContextWindow: number | null,
  *   error: unknown,
  *   messages: Array<{ lifecycle: string, phase: string | null, text: string }>,
  *   fileChanges: ThreadItem[],
@@ -40,9 +44,15 @@ import os from "node:os";
 import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
-import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
+import {
+  BROKER_BUSY_RPC_CODE,
+  BROKER_ENDPOINT_ENV,
+  BROKER_OPT_IN_ENV,
+  CodexAppServerClient
+} from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
-import { binaryAvailable } from "./process.mjs";
+import { binaryAvailable, resolveCodexBinary } from "./process.mjs";
+import { resolveRuntimeSettings } from "./runtime-settings.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -50,6 +60,14 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const REVIEW_ONLY_DEVELOPER_INSTRUCTIONS =
+  "This is a strictly read-only evidence review. Inspect files and repository history only. Never modify files or repository state. Never run tests, linters, builds, type checks, or other verification commands. Do not delegate this review back to the Codex companion. Report only evidence-based findings.";
+const TASK_DEVELOPER_INSTRUCTIONS =
+  "Complete the authorized requested work and infer routine implementation details. Do not begin with generic brainstorming, skill-selection, planning, or approval preambles. If blocked, finish all independent work first, then report the specific blocker. Preserve the requested scope: read-only and diagnosis requests do not authorize edits; implementation requests should use bounded, relevant verification.";
+const SINGLE_AGENT_DEVELOPER_INSTRUCTIONS =
+  "Do not spawn or delegate to subagents. Complete this work in the current thread.";
+const HEADLESS_DEVELOPER_INSTRUCTIONS =
+  "The current checkout is the sole evidence root for this review. Inspect its supplied diff and files only; do not inspect the live source checkout, parent directories, sibling worktrees, or earlier review reports. Do not discover, load, or invoke repository or user skills for this run.";
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -67,7 +85,9 @@ function buildThreadParams(cwd, options = {}) {
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
     serviceName: SERVICE_NAME,
-    ephemeral: options.ephemeral ?? true
+    ephemeral: options.ephemeral ?? true,
+    config: options.config ?? null,
+    developerInstructions: options.developerInstructions ?? null
   };
 }
 
@@ -78,7 +98,76 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: options.sandbox ?? "read-only",
+    config: options.config ?? null,
+    developerInstructions: options.developerInstructions ?? null
+  };
+}
+
+function buildRuntimeConfig(settings, options = {}) {
+  const config = {
+    review_model: settings.model,
+    features: {
+      multi_agent: settings.multiAgent
+    },
+    agents: {
+      job_max_runtime_seconds: settings.agentTimeoutSeconds
+    }
+  };
+
+  if (settings.contextWindow !== null) {
+    config.model_context_window = settings.contextWindow;
+  }
+  if (settings.autoCompactTokenLimit !== null) {
+    config.model_auto_compact_token_limit = settings.autoCompactTokenLimit;
+  }
+  if (settings.effort !== null) {
+    config.model_reasoning_effort = settings.effort;
+  }
+  if (options.headless) {
+    config.skills = { include_instructions: false };
+  }
+
+  return config;
+}
+
+function buildDeveloperInstructions(settings, options = {}) {
+  const instructions = [];
+  if (options.reviewOnly) {
+    instructions.push(REVIEW_ONLY_DEVELOPER_INSTRUCTIONS);
+  } else {
+    instructions.push(TASK_DEVELOPER_INSTRUCTIONS);
+  }
+  if (!settings.multiAgent) {
+    instructions.push(SINGLE_AGENT_DEVELOPER_INSTRUCTIONS);
+  }
+  if (options.headless) {
+    instructions.push(HEADLESS_DEVELOPER_INSTRUCTIONS);
+  }
+  if (typeof options.developerInstructions === "string" && options.developerInstructions.trim()) {
+    instructions.push(options.developerInstructions.trim());
+  }
+  return instructions.length > 0 ? instructions.join("\n\n") : null;
+}
+
+function buildRuntimeMetadata(threadResponse, settings, turnState) {
+  const model = threadResponse?.model ?? threadResponse?.thread?.model ?? null;
+  const reasoningEffort =
+    threadResponse?.reasoningEffort ?? threadResponse?.thread?.reasoningEffort ?? null;
+
+  return {
+    model,
+    reasoningEffort,
+    contextWindow: turnState.modelContextWindow,
+    configuredModel: settings.model,
+    configuredReasoningEffort: settings.effort,
+    configuredContextWindow: settings.contextWindow,
+    configuredAutoCompactTokenLimit: settings.autoCompactTokenLimit,
+    turnTimeoutMs: settings.turnTimeoutMs,
+    agentTimeoutSeconds: settings.agentTimeoutSeconds,
+    multiAgent: settings.multiAgent,
+    headless: settings.headless,
+    tokenUsage: turnState.tokenUsage
   };
 }
 
@@ -325,9 +414,12 @@ function createTurnCaptureState(threadId, options = {}) {
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
+    turnTimeoutTimer: null,
     lastAgentMessage: "",
     reviewText: "",
     reasoningSummary: [],
+    tokenUsage: null,
+    modelContextWindow: null,
     error: null,
     messages: [],
     fileChanges: [],
@@ -343,12 +435,24 @@ function clearCompletionTimer(state) {
   }
 }
 
+function clearTurnTimeoutTimer(state) {
+  if (state.turnTimeoutTimer) {
+    clearTimeout(state.turnTimeoutTimer);
+    state.turnTimeoutTimer = null;
+  }
+}
+
+function clearCaptureTimers(state) {
+  clearCompletionTimer(state);
+  clearTurnTimeoutTimer(state);
+}
+
 function completeTurn(state, turn = null, options = {}) {
   if (state.completed) {
     return;
   }
 
-  clearCompletionTimer(state);
+  clearCaptureTimers(state);
   state.completed = true;
 
   if (turn) {
@@ -368,6 +472,16 @@ function completeTurn(state, turn = null, options = {}) {
   }
 
   state.resolveCompletion(state);
+}
+
+function rejectTurnCapture(state, error) {
+  if (state.completed) {
+    return;
+  }
+  clearCaptureTimers(state);
+  state.completed = true;
+  state.error = error;
+  state.rejectCompletion(error);
 }
 
 function scheduleInferredCompletion(state) {
@@ -534,10 +648,32 @@ function applyTurnNotification(state, message) {
         emitProgress(state.onProgress, update?.message, update?.phase ?? null);
       }
       break;
-    case "error":
-      state.error = message.params.error;
-      emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
+    case "thread/tokenUsage/updated":
+      if ((message.params.threadId ?? null) === state.threadId) {
+        state.tokenUsage = message.params.tokenUsage ?? null;
+        state.modelContextWindow = message.params.tokenUsage?.modelContextWindow ?? null;
+      }
       break;
+    case "error": {
+      const error = message.params.error ?? { message: "Unknown Codex turn error." };
+      if (message.params.willRetry === true) {
+        emitProgress(state.onProgress, `Codex error; retrying: ${error.message}`, "retrying");
+        break;
+      }
+      if (message.params.threadId && message.params.threadId !== state.threadId) {
+        emitProgress(state.onProgress, `Codex subagent error: ${error.message}`, "investigating");
+        break;
+      }
+      state.error = error;
+      emitProgress(state.onProgress, `Codex error: ${error.message}`, "failed");
+      completeTurn(state, {
+        id: message.params.turnId ?? state.turnId ?? "failed-turn",
+        status: "failed",
+        items: [],
+        error
+      });
+      break;
+    }
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
@@ -556,9 +692,74 @@ function applyTurnNotification(state, message) {
   }
 }
 
+function interruptibleTurnId(state) {
+  if (state.turnId) {
+    return state.turnId;
+  }
+  for (let index = state.bufferedNotifications.length - 1; index >= 0; index -= 1) {
+    const message = state.bufferedNotifications[index];
+    if (message.method === "turn/started" && (message.params.threadId ?? null) === state.threadId) {
+      return message.params.turn.id ?? null;
+    }
+  }
+  return null;
+}
+
+function requestTurnInterrupt(client, state) {
+  const turnId = interruptibleTurnId(state);
+  if (!turnId) {
+    return false;
+  }
+  try {
+    void client.request("turn/interrupt", { threadId: state.threadId, turnId }).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function abortError(reason) {
+  if (reason instanceof Error) {
+    return reason;
+  }
+  const error = new Error(typeof reason === "string" && reason ? reason : "Codex turn was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
+function unexpectedClientExit(client, state) {
+  if (!client.exitPromise) {
+    return new Promise(() => {});
+  }
+  return Promise.resolve(client.exitPromise).then(
+    () => {
+      if (state.completed) {
+        return state;
+      }
+      const exitDetail = client.exitError instanceof Error ? client.exitError.message : null;
+      const stderr = cleanCodexStderr(client.stderr ?? "");
+      const detail = exitDetail ?? stderr;
+      throw new Error(
+        `Codex app-server connection closed before the turn completed.${detail ? `\n${detail}` : ""}`
+      );
+    },
+    (error) => {
+      if (state.completed) {
+        return state;
+      }
+      throw error instanceof Error
+        ? error
+        : new Error(`Codex app-server connection closed before the turn completed: ${String(error)}`);
+    }
+  );
+}
+
+/** @param {() => Promise<CaptureStartResponse>} startRequest */
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  const signal = options.signal ?? null;
+  let abortHandler = null;
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
@@ -582,7 +783,48 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   });
 
   try {
-    const response = await startRequest();
+    abortHandler = () => {
+      requestTurnInterrupt(client, state);
+      rejectTurnCapture(state, abortError(signal?.reason));
+    };
+    if (signal?.aborted) {
+      abortHandler();
+      return await state.completion;
+    }
+    signal?.addEventListener("abort", abortHandler, { once: true });
+
+    if (options.turnTimeoutMs) {
+      state.turnTimeoutTimer = setTimeout(() => {
+        const interruptRequested = requestTurnInterrupt(client, state);
+        const error = /** @type {Error & { code: string, timeoutMs: number }} */ (
+          new Error(
+            `Codex turn timed out after ${options.turnTimeoutMs} ms${interruptRequested ? "; an interrupt was requested" : ""}.`
+          )
+        );
+        error.code = "CODEX_TURN_TIMEOUT";
+        error.timeoutMs = options.turnTimeoutMs;
+        rejectTurnCapture(state, error);
+      }, options.turnTimeoutMs);
+      state.turnTimeoutTimer.unref?.();
+    }
+
+    const exitBeforeCompletion = unexpectedClientExit(client, state);
+    const startOutcome = await Promise.race([
+      Promise.resolve()
+        .then(startRequest)
+        .then((response) => /** @type {const} */ ({ type: "response", response })),
+      state.completion.then(
+        (completedState) => /** @type {const} */ ({ type: "completed", state: completedState })
+      ),
+      exitBeforeCompletion.then(
+        (completedState) => /** @type {const} */ ({ type: "completed", state: completedState })
+      )
+    ]);
+    if (startOutcome.type === "completed") {
+      return startOutcome.state;
+    }
+
+    const response = startOutcome.response;
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
@@ -603,25 +845,47 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    return await Promise.race([state.completion, exitBeforeCompletion]);
   } finally {
-    clearCompletionTimer(state);
+    clearCaptureTimers(state);
+    if (abortHandler) {
+      signal?.removeEventListener("abort", abortHandler);
+    }
     client.setNotificationHandler(previousHandler ?? null);
   }
 }
 
-async function withAppServer(cwd, fn) {
+function useBroker(options = {}) {
+  if (options.disableBroker !== undefined) {
+    return !options.disableBroker;
+  }
+  const value = options.env?.[BROKER_OPT_IN_ENV] ?? process.env[BROKER_OPT_IN_ENV];
+  return typeof value === "string" && ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+async function withAppServer(cwd, fn, options = {}) {
   let client = null;
+  let fnStarted = false;
+  const brokerEnabled = useBroker(options);
   try {
-    client = await CodexAppServerClient.connect(cwd);
+    client = await CodexAppServerClient.connect(cwd, {
+      env: options.env,
+      disableBroker: !brokerEnabled,
+      useBroker: brokerEnabled
+    });
+    fnStarted = true;
     const result = await fn(client);
     await client.close();
     return result;
   } catch (error) {
-    const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
+    const brokerTransport = client?.transport === "broker" || error?.transport === "broker";
+    const brokerRequested =
+      brokerTransport ||
+      Boolean(options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV]);
     const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      (brokerTransport && !client?.hasAcceptedMutation && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
+      (!fnStarted && brokerRequested &&
+        (error?.brokerFatal === true || error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
 
     if (client) {
       await client.close().catch(() => {});
@@ -632,7 +896,10 @@ async function withAppServer(cwd, fn) {
       throw error;
     }
 
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+    const directClient = await CodexAppServerClient.connect(cwd, {
+      env: options.env,
+      disableBroker: true
+    });
     try {
       return await fn(directClient);
     } finally {
@@ -641,8 +908,11 @@ async function withAppServer(cwd, fn) {
   }
 }
 
-async function withDirectAppServer(cwd, fn) {
-  const client = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+async function withDirectAppServer(cwd, fn, options = {}) {
+  const client = await CodexAppServerClient.connect(cwd, {
+    env: options.env,
+    disableBroker: true
+  });
   try {
     return await fn(client);
   } finally {
@@ -749,6 +1019,40 @@ async function startThread(client, cwd, options = {}) {
 
 async function resumeThread(client, threadId, cwd, options = {}) {
   return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+}
+
+function canonicalWorkspacePath(workspacePath) {
+  const resolved = path.resolve(workspacePath);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function sameWorkspacePath(left, right) {
+  const canonicalLeft = canonicalWorkspacePath(left);
+  const canonicalRight = canonicalWorkspacePath(right);
+  if (process.platform === "win32") {
+    return canonicalLeft.toLowerCase() === canonicalRight.toLowerCase();
+  }
+  return canonicalLeft === canonicalRight;
+}
+
+async function assertResumeWorkspace(client, threadId, cwd) {
+  const response = await client.request("thread/read", {
+    threadId,
+    includeTurns: false
+  });
+  const sourceCwd = response.thread?.cwd;
+  if (typeof sourceCwd !== "string" || !sourceCwd.trim()) {
+    throw new Error(`Cannot safely resume Codex thread ${threadId}: its workspace path is unavailable.`);
+  }
+  if (!sameWorkspacePath(sourceCwd, cwd)) {
+    throw new Error(
+      `Cannot resume Codex thread ${threadId} in a different workspace. Thread workspace: ${sourceCwd}. Current workspace: ${cwd}. Run the command from the thread workspace, or start a new task with --fresh.`
+    );
+  }
 }
 
 function buildResultStatus(turnState) {
@@ -883,13 +1187,14 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   }
 }
 
-export function getCodexAvailability(cwd) {
-  const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
+export function getCodexAvailability(cwd, env = process.env) {
+  const codexBinary = resolveCodexBinary(env);
+  const versionStatus = binaryAvailable(codexBinary, ["--version"], { cwd, env });
   if (!versionStatus.available) {
     return versionStatus;
   }
 
-  const appServerStatus = binaryAvailable("codex", ["app-server", "--help"], { cwd });
+  const appServerStatus = binaryAvailable(codexBinary, ["app-server", "--help"], { cwd, env });
   if (!appServerStatus.available) {
     return {
       available: false,
@@ -904,26 +1209,29 @@ export function getCodexAvailability(cwd) {
 }
 
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
-  if (endpoint) {
+  const brokerEnabled = useBroker({ env });
+  if (brokerEnabled) {
+    const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
     return {
       mode: "shared",
       label: "shared session",
-      detail: "This Claude session is configured to reuse one shared Codex runtime.",
+      detail: endpoint
+        ? "This Claude session is configured to reuse one shared Codex runtime."
+        : "This Claude session will start and reuse one shared Codex runtime on demand.",
       endpoint
     };
   }
 
   return {
     mode: "direct",
-    label: "direct startup",
-    detail: "No shared Codex runtime is active yet. The first review or task command will start one on demand.",
+    label: "direct per-job process",
+    detail: "Each review or task uses its own Codex app-server process and closes it when the run finishes.",
     endpoint: null
   };
 }
 
 export async function getCodexAuthStatus(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
+  const availability = getCodexAvailability(cwd, options.env);
   if (!availability.available) {
     return {
       available: false,
@@ -939,9 +1247,12 @@ export async function getCodexAuthStatus(cwd, options = {}) {
 
   let client = null;
   try {
+    const brokerEnabled = useBroker({ env: options.env, disableBroker: options.disableBroker });
     client = await CodexAppServerClient.connect(cwd, {
       env: options.env,
-      reuseExistingBroker: true
+      disableBroker: !brokerEnabled,
+      useBroker: brokerEnabled,
+      reuseExistingBroker: brokerEnabled
     });
     return await getCodexAuthStatusFromClient(client, cwd);
   } catch (error) {
@@ -1000,20 +1311,31 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
 }
 
 export async function runAppServerReview(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
+  const resolvedSettings = options.settings ?? resolveRuntimeSettings({ ...options, env: options.env });
+  const settings = {
+    ...resolvedSettings,
+    headless: Boolean(options.headless ?? resolvedSettings.headless)
+  };
+  const availability = getCodexAvailability(cwd, options.env);
   if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
   return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
-    const thread = await startThread(client, cwd, {
-      model: options.model,
+    const threadResponse = await startThread(client, cwd, {
+      model: settings.model,
       sandbox: "read-only",
       ephemeral: true,
-      threadName: options.threadName
+      threadName: options.threadName,
+      config: buildRuntimeConfig(settings, { headless: settings.headless }),
+      developerInstructions: buildDeveloperInstructions(settings, {
+        reviewOnly: true,
+        headless: settings.headless,
+        developerInstructions: options.developerInstructions
+      })
     });
-    const sourceThreadId = thread.thread.id;
+    const sourceThreadId = threadResponse.thread.id;
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
       threadId: sourceThreadId
     });
@@ -1030,6 +1352,8 @@ export async function runAppServerReview(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
+        signal: options.signal,
+        turnTimeoutMs: settings.turnTimeoutMs,
         onResponse(response, state) {
           if (response.reviewThreadId) {
             state.threadIds.add(response.reviewThreadId);
@@ -1048,15 +1372,16 @@ export async function runAppServerReview(cwd, options = {}) {
       turnId: turnState.turnId,
       reviewText: turnState.reviewText,
       reasoningSummary: turnState.reasoningSummary,
+      runtime: buildRuntimeMetadata(threadResponse, settings, turnState),
       turn: turnState.finalTurn,
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr)
     };
-  });
+  }, { env: options.env, disableBroker: options.disableBroker });
 }
 
 export async function importExternalAgentSession(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
+  const availability = getCodexAvailability(cwd, options.env);
   if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
@@ -1089,35 +1414,57 @@ export async function importExternalAgentSession(cwd, options = {}) {
       threadId,
       stderr: cleanCodexStderr(client.stderr)
     };
-  });
+  }, { env: options.env });
 }
 
 export async function runAppServerTurn(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
+  const resolvedSettings = options.settings ?? resolveRuntimeSettings({ ...options, env: options.env });
+  const settings = {
+    ...resolvedSettings,
+    headless: Boolean(options.headless ?? resolvedSettings.headless)
+  };
+  const reviewOnly = Boolean(options.reviewOnly);
+  const availability = getCodexAvailability(cwd, options.env);
   if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
   return withAppServer(cwd, async (client) => {
     let threadId;
+    let threadResponse;
+    const sandbox = reviewOnly ? "read-only" : options.sandbox;
+    const config = buildRuntimeConfig(settings, { headless: settings.headless });
+    const developerInstructions = buildDeveloperInstructions(settings, {
+      reviewOnly,
+      headless: settings.headless,
+      developerInstructions: options.developerInstructions
+    });
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
-        ephemeral: false
+      await assertResumeWorkspace(client, options.resumeThreadId, cwd);
+      threadResponse = await resumeThread(client, options.resumeThreadId, cwd, {
+        model: settings.model,
+        sandbox,
+        config,
+        developerInstructions
       });
-      threadId = response.thread.id;
+      threadId = threadResponse.thread.id;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
-      const response = await startThread(client, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
-        ephemeral: options.persistThread ? false : true,
-        threadName: options.persistThread ? options.threadName : options.threadName ?? null
+      threadResponse = await startThread(client, cwd, {
+        model: settings.model,
+        sandbox,
+        ephemeral: reviewOnly || settings.headless ? true : options.persistThread ? false : true,
+        threadName: reviewOnly
+          ? null
+          : options.persistThread
+            ? options.threadName
+            : options.threadName ?? null,
+        config,
+        developerInstructions
       });
-      threadId = response.thread.id;
+      threadId = threadResponse.thread.id;
     }
 
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
@@ -1136,11 +1483,15 @@ export async function runAppServerTurn(cwd, options = {}) {
         client.request("turn/start", {
           threadId,
           input: buildTurnInput(prompt),
-          model: options.model ?? null,
-          effort: options.effort ?? null,
+          model: settings.model,
+          effort: settings.effort,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      {
+        onProgress: options.onProgress,
+        signal: options.signal,
+        turnTimeoutMs: settings.turnTimeoutMs
+      }
     );
 
     return {
@@ -1149,6 +1500,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       turnId: turnState.turnId,
       finalMessage: turnState.lastAgentMessage,
       reasoningSummary: turnState.reasoningSummary,
+      runtime: buildRuntimeMetadata(threadResponse, settings, turnState),
       turn: turnState.finalTurn,
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr),
@@ -1156,7 +1508,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions
     };
-  });
+  }, { env: options.env, disableBroker: options.disableBroker });
 }
 
 export async function findLatestTaskThread(cwd) {

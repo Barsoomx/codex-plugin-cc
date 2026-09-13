@@ -1,43 +1,31 @@
 ---
 name: codex-cli-runtime
-description: Internal helper contract for calling the codex-companion runtime from Claude Code
+description: Internal runtime contract for the codex-rescue forwarding wrapper
 user-invocable: false
 ---
 
 # Codex Runtime
 
-Use this skill only inside the `codex:codex-rescue` subagent.
+Use this skill only inside the `codex:codex-rescue` subagent. The parent command prepares the argument file; the wrapper performs one launcher call and returns its stdout.
 
-Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+## Launcher
 
-Execution rules:
-- The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
-- Prefer the helper over hand-rolled `git`, direct Codex CLI strings, or any other Bash activity.
-- Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel` from `codex:codex-rescue`.
-- Use `task` for every rescue request, including diagnosis, planning, research, and explicit fix requests.
-- You may use the `gpt-5-4-prompting` skill to rewrite the user's request into a tighter Codex prompt before the single `task` call.
-- That prompt drafting is the only Claude-side work allowed. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
-- Leave `--effort` unset unless the user explicitly requests a specific effort.
-- Leave model unset by default. Add `--model` only when the user explicitly asks for one.
-- Map `spark` to `--model gpt-5.3-codex-spark`.
-- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+The parent prompt supplies concrete absolute values for `<plugin root>` and `<args-file path>`. Invoke the companion with those values:
 
-Command selection:
-- Use exactly one `task` invocation per rescue handoff.
-- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
-- If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
-- If the forwarded request includes `--effort`, pass it through to `task`.
-- If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
-- If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
-- `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
-- `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
-- `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
-- `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
+```bash
+node "<absolute plugin root>/scripts/codex-companion.mjs" task --args-file "<absolute args-file path>" --consume-args-file
+```
 
-Safety rules:
-- Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.
-- Preserve the user's task text as-is apart from stripping routing flags.
-- Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
-- Return the stdout of the `task` command exactly as-is.
-- If the Bash call fails or Codex cannot be invoked, return nothing.
+The args file is a JSON array of string tokens. It already has separate flags and values and preserves complete task text as one token after `--`. Pass it unchanged; the invocation consumes the generated temporary file after parsing. Never use a raw command placeholder, `eval`, shell interpolation, or an empty-root `/scripts/codex-companion.mjs` path. If the parent did not supply concrete paths, return an invocation error.
+
+Make exactly one `task` invocation and return stdout verbatim, including queued job ID, log path, errors, and follow-up commands. Do not create or edit an args file in this subagent.
+
+## Execution and routing
+
+The companion task is detached and queued by default. `--background` explicitly selects detached execution. `--wait` starts the durable detached worker and keeps this command waiting for completion, so the job remains recoverable if the caller closes. Do not create a second background layer.
+
+Forward `--resume <thread-id>` only for that exact thread, `--resume-last` only when explicitly requested, and `--fresh` for a new thread. Never autoresume an unrelated latest thread and never ask for a confirmation that the request already answered.
+
+Accepted model aliases are `astra`, `sol`, `luna`, `terra`, and `spark`; the `astra` default maps to `gpt-6-astra` with `ultra` reasoning. Accepted efforts are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. Requested runtime defaults are `--context-window 1000000`, `--auto-compact-token-limit 800000`, `--turn-timeout-ms 10800000`, `--job-timeout-ms 10800000`, and `--agent-timeout-seconds 9600`; the app server may report a lower effective context window. Subagents are opt-in with `--multi-agent`; the default task has no subagents.
+
+Do not invoke setup, review, adversarial-review, status, result, or cancel from the rescue wrapper. Do not inspect the repository, reason through the task, monitor progress, or add follow-up work. If the launcher fails, return the failure and stop.

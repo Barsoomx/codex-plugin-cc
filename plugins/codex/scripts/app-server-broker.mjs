@@ -8,8 +8,18 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { cleanupOwnedBrokerSession } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const BROKER_IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
+const BROKER_SHUTDOWN_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_SHUTDOWN_TIMEOUT_MS";
+const DEFAULT_BROKER_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_BROKER_SHUTDOWN_TIMEOUT_MS = 5_000;
+
+function resolveTimeoutMs(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -48,11 +58,11 @@ function writePidFile(pidFile) {
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>] [--log-file <path>]");
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "log-file", "endpoint", "idle-timeout-ms"]
   });
 
   if (!options.endpoint) {
@@ -63,59 +73,125 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
-  writePidFile(pidFile);
+  const logFile = options["log-file"]
+    ? path.resolve(options["log-file"])
+    : (pidFile ? path.join(path.dirname(pidFile), "broker.log") : null);
+  const idleTimeoutMs = resolveTimeoutMs(
+    options["idle-timeout-ms"] ?? process.env[BROKER_IDLE_TIMEOUT_ENV],
+    DEFAULT_BROKER_IDLE_TIMEOUT_MS
+  );
+  const shutdownTimeoutMs = resolveTimeoutMs(
+    process.env[BROKER_SHUTDOWN_TIMEOUT_ENV],
+    DEFAULT_BROKER_SHUTDOWN_TIMEOUT_MS
+  );
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let pendingRequestCount = 0;
   const sockets = new Set();
+  let idleTimer = null;
+  let shutdownPromise = null;
 
-  function clearSocketOwnership(socket) {
-    if (activeRequestSocket === socket) {
-      activeRequestSocket = null;
-    }
-    if (activeStreamSocket === socket) {
-      activeStreamSocket = null;
-      activeStreamThreadIds = null;
+  function cancelIdleShutdown() {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
     }
   }
 
   function routeNotification(message) {
     const target = activeRequestSocket ?? activeStreamSocket;
-    if (!target) {
-      return;
+    if (target) {
+      send(target, message);
     }
-    send(target, message);
-    if (message.method === "turn/completed" && activeStreamSocket === target) {
+    if (message.method === "turn/completed" && activeStreamSocket) {
       const threadId = message.params?.threadId ?? null;
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
         activeStreamSocket = null;
         activeStreamThreadIds = null;
-        if (activeRequestSocket === target) {
-          activeRequestSocket = null;
-        }
+        scheduleIdleShutdown(server);
       }
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
+  function waitForServerClose(server) {
+    let timer;
+    const closed = new Promise((resolve) => {
+      if (!server.listening) {
+        resolve();
+        return;
+      }
+      server.close(resolve);
+    });
+    return Promise.race([
+      closed,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, shutdownTimeoutMs);
+      })
+    ]).finally(() => clearTimeout(timer));
+  }
+
+  function shutdown(server) {
+    if (shutdownPromise) {
+      return shutdownPromise;
     }
-    await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+    cancelIdleShutdown();
+    shutdownPromise = (async () => {
+      const serverClosed = waitForServerClose(server);
+      for (const socket of sockets) {
+        socket.end();
+      }
+      const forceSocketTimer = setTimeout(() => {
+        for (const socket of sockets) {
+          socket.destroy();
+        }
+      }, Math.min(250, shutdownTimeoutMs));
+      await Promise.all([
+        appClient.close().catch(() => {}),
+        serverClosed
+      ]).finally(() => {
+        clearTimeout(forceSocketTimer);
+        for (const socket of sockets) {
+          socket.destroy();
+        }
+      });
+      await cleanupOwnedBrokerSession(cwd, {
+        endpoint,
+        pidFile,
+        logFile,
+        sessionDir: pidFile ? path.dirname(pidFile) : null,
+        pid: process.pid
+      });
+    })();
+    return shutdownPromise;
+  }
+
+  function scheduleIdleShutdown(server) {
+    cancelIdleShutdown();
+    if (shutdownPromise || sockets.size > 0 || pendingRequestCount > 0 || activeRequestSocket || activeStreamSocket) {
+      return;
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
-    }
+
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (sockets.size > 0 || pendingRequestCount > 0 || activeRequestSocket || activeStreamSocket) {
+        return;
+      }
+      shutdown(server).finally(() => process.exit(0));
+    }, idleTimeoutMs);
   }
 
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
+    if (shutdownPromise) {
+      socket.on("error", () => {});
+      socket.destroy();
+      return;
+    }
+    cancelIdleShutdown();
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
@@ -161,6 +237,7 @@ async function main() {
           send(socket, { id: message.id, result: {} });
           await shutdown(server);
           process.exit(0);
+          return;
         }
 
         if (message.id === undefined) {
@@ -182,6 +259,7 @@ async function main() {
         }
 
         if (allowInterruptDuringActiveStream) {
+          pendingRequestCount += 1;
           try {
             const result = await appClient.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
@@ -190,60 +268,97 @@ async function main() {
               id: message.id,
               error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
             });
+          } finally {
+            pendingRequestCount -= 1;
+            scheduleIdleShutdown(server);
           }
           continue;
         }
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        pendingRequestCount += 1;
+        if (isStreaming) {
+          activeStreamSocket = socket;
+          activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, {});
+        }
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          if (isStreaming) {
-            activeStreamSocket = socket;
-            activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
-          }
-          if (activeRequestSocket === socket) {
-            activeRequestSocket = null;
+          if (isStreaming && activeStreamSocket === socket) {
+            for (const threadId of buildStreamThreadIds(message.method, message.params ?? {}, result)) {
+              activeStreamThreadIds.add(threadId);
+            }
           }
         } catch (error) {
           send(socket, {
             id: message.id,
             error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
           });
+          if (isStreaming && activeStreamSocket === socket) {
+            activeStreamSocket = null;
+            activeStreamThreadIds = null;
+          }
+        } finally {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (activeStreamSocket === socket && !isStreaming) {
-            activeStreamSocket = null;
-          }
+          pendingRequestCount -= 1;
+          scheduleIdleShutdown(server);
         }
       }
     });
 
-    socket.on("close", () => {
+    function handleSocketLoss() {
       sockets.delete(socket);
-      clearSocketOwnership(socket);
-    });
+      if (!shutdownPromise && activeStreamSocket === socket) {
+        shutdown(server).finally(() => process.exit(1));
+        return;
+      }
+      scheduleIdleShutdown(server);
+    }
 
-    socket.on("error", () => {
-      sockets.delete(socket);
-      clearSocketOwnership(socket);
-    });
+    socket.on("close", handleSocketLoss);
+    socket.on("error", handleSocketLoss);
   });
 
-  process.on("SIGTERM", async () => {
+  appClient.exitPromise.then(() => {
+    if (!shutdownPromise) {
+      shutdown(server).finally(() => process.exit(1));
+    }
+  });
+
+  process.once("SIGTERM", async () => {
     await shutdown(server);
     process.exit(0);
   });
 
-  process.on("SIGINT", async () => {
+  process.once("SIGINT", async () => {
     await shutdown(server);
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(listenTarget.path, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+  } catch (error) {
+    await shutdown(server);
+    throw error;
+  }
+  writePidFile(pidFile);
+  server.on("error", (error) => {
+    if (!shutdownPromise) {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      shutdown(server).finally(() => process.exit(1));
+    }
+  });
+  scheduleIdleShutdown(server);
 }
 
 main().catch((error) => {

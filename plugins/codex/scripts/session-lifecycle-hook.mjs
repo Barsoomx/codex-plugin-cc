@@ -2,20 +2,22 @@
 
 import fs from "node:fs";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
-  clearBrokerSession,
+  clearBrokerSessionIfOwned,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { listJobs, resolveStateFile, upsertJob } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { readProcessIdentity } from "./lib/worker-identity.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
@@ -50,38 +52,42 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
+  const removedJobs = listJobs(workspaceRoot).filter((job) => job.sessionId === sessionId);
   if (removedJobs.length === 0) {
     return;
   }
 
   for (const job of removedJobs) {
     const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
+    if (!stillRunning || job.detached) {
       continue;
     }
     try {
-      terminateProcessTree(job.pid ?? Number.NaN);
+      const identity = readProcessIdentity(job.pid);
+      if (job.workerIdentity && identity && identity.bootId === job.workerIdentity.bootId && identity.startTime === job.workerIdentity.startTime) {
+        terminateProcessTree(job.pid);
+      }
     } catch {
       // Ignore teardown failures during session shutdown.
     }
+    const stopped = { ...job, status: "cancelled", phase: "cancelled", pid: null, completedAt: new Date().toISOString(), errorMessage: "Claude session ended before foreground work completed." };
+    upsertJob(workspaceRoot, stopped);
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
 }
 
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  appendEnvVar("CODEX_COMPANION_ROOT", fileURLToPath(new URL("..", import.meta.url)));
 }
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
+  cleanupSessionJobs(cwd, sessionId);
+  // Detached workers outlive the caller and may still be using an opt-in broker.
+  if (listJobs(resolveWorkspaceRoot(cwd)).some(job => job.detached && (job.status === "queued" || job.status === "running"))) return;
   const brokerSession =
     loadBrokerSession(cwd) ??
     (process.env[BROKER_ENDPOINT_ENV]
@@ -96,21 +102,29 @@ async function handleSessionEnd(input) {
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
+  const ownsBroker = brokerSession?.sessionId === sessionId && Boolean(sessionId);
+  const explicitEndpoint = brokerEndpoint && process.env[BROKER_ENDPOINT_ENV] === brokerEndpoint;
+  // A registry entry alone does not prove ownership of a broker from another
+  // live Claude session, particularly one left by the previous plugin version.
+  if (!ownsBroker && !explicitEndpoint) return;
 
+  let acknowledged = false;
   if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
+    acknowledged = await sendBrokerShutdown(brokerEndpoint);
   }
+  if (!acknowledged) return;
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,
     logFile,
     sessionDir,
     pid,
-    killProcess: terminateProcessTree
+    // The acknowledged broker shuts down its own ChildProcess handles. A PID
+    // loaded from a file is not sufficient evidence for a separate kill here.
+    killProcess: null
   });
-  clearBrokerSession(cwd);
+  await clearBrokerSessionIfOwned(cwd, brokerSession);
 }
 
 async function main() {
