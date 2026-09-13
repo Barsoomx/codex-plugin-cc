@@ -206,7 +206,8 @@ function escapeRegExp(value) {
 }
 
 function normalizePrefix(value) {
-  return path.resolve(value).replace(/[\\/]+$/, "");
+  const absolute = /^[a-z]:[\\/]/i.test(value) ? value : path.resolve(value);
+  return absolute.replace(/[\\/]+$/, "");
 }
 
 /**
@@ -229,7 +230,7 @@ export function normalizeReviewPaths(text, snapshotRoot, originalRoot = null) {
     return [root, slash, backslash];
   });
   const expression = variants.sort((a, b) => b.length - a.length).map(escapeRegExp).join("|");
-  const windowsInsensitive = process.platform === "win32" ? "i" : "";
+  const windowsInsensitive = process.platform === "win32" || roots.some(root => /^[a-z]:[\\/]/i.test(root)) ? "i" : "";
   const prefixPattern = new RegExp(`(?:${expression})(?:[\\\\/]+)?([^\\s\\r\\n\\]}>\\),\\\"']*)?`, `g${windowsInsensitive}`);
   return text.replace(prefixPattern, (_match, tail = "") => tail.replaceAll("\\", "/"));
 }

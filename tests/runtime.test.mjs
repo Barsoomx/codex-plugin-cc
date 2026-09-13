@@ -1434,17 +1434,18 @@ test("status preserves adversarial review kind labels", () => {
 
 test("status --wait times out cleanly when a job is still active", () => {
   const workspace = makeTempDir();
+  const jobId = `task-live-${path.basename(workspace)}`;
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  const logFile = path.join(jobsDir, "task-live.log");
+  const logFile = path.join(jobsDir, `${jobId}.log`);
   fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
   fs.writeFileSync(
-    path.join(jobsDir, "task-live.json"),
+    path.join(jobsDir, `${jobId}.json`),
     JSON.stringify(
       {
-        id: "task-live",
+        id: jobId,
         status: "running",
         title: "Codex Task",
         logFile
@@ -1463,7 +1464,7 @@ test("status --wait times out cleanly when a job is still active", () => {
         config: { stopReviewGate: false },
         jobs: [
           {
-            id: "task-live",
+            id: jobId,
             status: "running",
             title: "Codex Task",
             jobClass: "task",
@@ -1481,13 +1482,13 @@ test("status --wait times out cleanly when a job is still active", () => {
     "utf8"
   );
 
-  const result = run("node", [SCRIPT, "status", "task-live", "--wait", "--timeout-ms", "25", "--json"], {
+  const result = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "25", "--json"], {
     cwd: workspace
   });
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
-  assert.equal(payload.job.id, "task-live");
+  assert.equal(payload.job.id, jobId);
   assert.equal(payload.job.status, "running");
   assert.equal(payload.waitTimedOut, true);
 });

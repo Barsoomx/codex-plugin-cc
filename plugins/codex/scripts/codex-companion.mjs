@@ -995,7 +995,9 @@ function handleResult(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
-  const storedJob = readStoredJob(workspaceRoot, job.id);
+  // The resolver already selected the authoritative record in this workspace.
+  // A second global lookup can be ambiguous for unrelated legacy IDs elsewhere.
+  const storedJob = job;
   const payload = {
     job,
     storedJob
