@@ -1,5 +1,13 @@
 # WSL validation and migration
 
+## Installed release
+
+On 2026-09-13, `codex@codex-astra` **1.1.0** was installed and enabled at user scope in WSL. Source checkout: `/root/src/codex-plugin-cc-astra`; installed cache: `/root/.claude/plugins/cache/codex-astra/codex/1.1.0`. All 46 tracked plugin files matched the release checkout byte-for-byte. Code release commit: `7f0314dcb81216ae076a00fe0423df280ffd5fa9`.
+
+The old `codex@codex-local` was disabled, not uninstalled. Its source checkout, cache, and pre-existing two-file working diff were preserved. A fresh Claude Code process successfully invoked the installed `/codex:setup` without `--plugin-dir` and without permission denials.
+
+Validation completed: **134/134 tests passed** sequentially in native WSL with real Codex disabled for the test harness; TypeScript build, version consistency, plugin manifest and marketplace manifest checks passed. Independent read-only review findings were corrected and rechecked. Existing Claude sessions need a restart to load the new enabled plugin.
+
 ## Preserving the previous installation
 
 The previous plugin is `codex@codex-local` 1.0.6-local.2. Its native source checkout is `/root/src/codex-plugin-cc`, branch `local-hardening`, with pre-existing uncommitted changes in the companion and runtime modules. Do not reset, clean, overwrite or remove that checkout.
