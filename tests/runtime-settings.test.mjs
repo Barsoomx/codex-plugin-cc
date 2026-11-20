@@ -168,7 +168,7 @@ test("model aliases and explicit non-Astra settings preserve their own defaults"
       headless: false
     }
   );
-  assert.equal(resolveRuntimeSettings({ model: "astra", env: {} }).model, "gpt-6-astra");
+  assert.equal(resolveRuntimeSettings({ model: "astra", env: {} }).model, "gpt-6.2-astra");
   assert.equal(resolveRuntimeSettings({ model: "spark", env: {} }).model, "gpt-5.3-codex-spark");
   assert.equal(resolveRuntimeSettings({ model: "terra", env: {} }).model, "gpt-5.6-terra");
   assert.equal(resolveRuntimeSettings({ model: "luna", env: {} }).model, "gpt-5.6-luna");
@@ -196,7 +196,7 @@ test("CLI-style values override environment settings without losing explicit fal
   });
 
   assert.deepEqual(settings, {
-    model: "gpt-6-astra",
+    model: "gpt-6.2-astra",
     effort: "max",
     contextWindow: 900000,
     autoCompactTokenLimit: 700000,
@@ -238,15 +238,32 @@ test("reasoning effort validation accepts max and ultra but rejects unsupported 
   assert.equal(resolveRuntimeSettings({ model: "sol", effort: "none", env: {} }).effort, "none");
   assert.throws(
     () => resolveRuntimeSettings({ model: "astra", effort: "none", env: {} }),
-    /GPT-6 Astra does not support reasoning effort "none"/
+    /gpt-6\.2-astra does not support reasoning effort "none"/
   );
   assert.throws(
     () => resolveRuntimeSettings({ model: "astra", effort: "minimal", env: {} }),
-    /GPT-6 Astra does not support reasoning effort "minimal"/
+    /gpt-6\.2-astra does not support reasoning effort "minimal"/
   );
   assert.throws(
     () => resolveRuntimeSettings({ effort: "extreme", env: {} }),
     /Unsupported reasoning effort/
+  );
+});
+
+test("explicit GPT-6 Astra keeps Astra runtime defaults and effort limits", () => {
+  assert.deepEqual(resolveRuntimeSettings({ model: "gpt-6-astra", env: {} }), {
+    model: "gpt-6-astra",
+    effort: DEFAULT_ASTRA_EFFORT,
+    contextWindow: DEFAULT_ASTRA_CONTEXT_WINDOW,
+    autoCompactTokenLimit: DEFAULT_ASTRA_AUTO_COMPACT_TOKEN_LIMIT,
+    turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
+    agentTimeoutSeconds: DEFAULT_AGENT_TIMEOUT_SECONDS,
+    multiAgent: false,
+    headless: false
+  });
+  assert.throws(
+    () => resolveRuntimeSettings({ model: "gpt-6-astra", effort: "none", env: {} }),
+    /gpt-6-astra does not support reasoning effort "none"/
   );
 });
 
@@ -260,7 +277,7 @@ test("token and timeout bounds fail early", () => {
   assert.deepEqual(
     resolveRuntimeSettings({ contextWindow: 800000, env: {} }),
     {
-      model: "gpt-6-astra",
+      model: "gpt-6.2-astra",
       effort: "ultra",
       contextWindow: 800000,
       autoCompactTokenLimit: 720000,
@@ -309,10 +326,10 @@ test("fresh and resumed turns receive the same runtime config and expose observe
   assert.equal(fresh.ok, true, fresh.error?.message);
   assert.equal(fresh.result.status, 0);
   assert.deepEqual(fresh.result.runtime, {
-    model: "gpt-6-astra",
+    model: "gpt-6.2-astra",
     reasoningEffort: "ultra",
     contextWindow: 828400,
-    configuredModel: "gpt-6-astra",
+    configuredModel: "gpt-6.2-astra",
     configuredReasoningEffort: "ultra",
     configuredContextWindow: 1000000,
     configuredAutoCompactTokenLimit: 800000,
@@ -330,11 +347,11 @@ test("fresh and resumed turns receive the same runtime config and expose observe
   let state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   const start = state.requests.find((request) => request.method === "thread/start");
   const turn = state.requests.find((request) => request.method === "turn/start");
-  assert.equal(start.params.model, "gpt-6-astra");
+  assert.equal(start.params.model, "gpt-6.2-astra");
   assert.equal(start.params.sandbox, "read-only");
   assert.equal(start.params.ephemeral, true);
   assert.deepEqual(start.params.config, {
-    review_model: "gpt-6-astra",
+    review_model: "gpt-6.2-astra",
     features: { multi_agent: false },
     agents: { job_max_runtime_seconds: 9600 },
     model_context_window: 1000000,
@@ -346,7 +363,7 @@ test("fresh and resumed turns receive the same runtime config and expose observe
   assert.match(start.params.developerInstructions, /Never run tests, linters, builds/i);
   assert.match(start.params.developerInstructions, /Do not spawn or delegate to subagents/i);
   assert.match(start.params.developerInstructions, /Do not discover, load, or invoke repository or user skills/i);
-  assert.equal(turn.params.model, "gpt-6-astra");
+  assert.equal(turn.params.model, "gpt-6.2-astra");
   assert.equal(turn.params.effort, "ultra");
 
   const resumed = invokeTurn(binDir, cwd, {
@@ -357,14 +374,16 @@ test("fresh and resumed turns receive the same runtime config and expose observe
   assert.equal(resumed.ok, true, resumed.error?.message);
   state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   const resume = state.requests.filter((request) => request.method === "thread/resume").at(-1);
-  assert.equal(resume.params.model, "gpt-6-astra");
+  assert.equal(resume.params.model, "gpt-6.2-astra");
   assert.equal(resume.params.config.model_context_window, 1000000);
   assert.equal(resume.params.config.model_auto_compact_token_limit, 800000);
   assert.equal(resume.params.config.model_reasoning_effort, "ultra");
-  assert.equal(resume.params.config.review_model, "gpt-6-astra");
+  assert.equal(resume.params.config.review_model, "gpt-6.2-astra");
   assert.deepEqual(resume.params.config.features, { multi_agent: false });
   assert.match(resume.params.developerInstructions, /Complete the authorized requested work/i);
   assert.match(resume.params.developerInstructions, /Do not begin with generic brainstorming/i);
+  assert.match(resume.params.developerInstructions, /Do not end the turn with a plan, an offer, or a routine question/i);
+  assert.match(resume.params.developerInstructions, /final answer self-contained/i);
 
   const resumeCount = state.requests.filter((request) => request.method === "thread/resume").length;
   const turnCount = state.requests.filter((request) => request.method === "turn/start").length;

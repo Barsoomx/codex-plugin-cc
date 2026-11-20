@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0
+
+- Default `astra` to `gpt-6.2-astra` (Codex CLI 0.171.0+); explicit `gpt-6-astra` keeps the Astra effort, context and compaction defaults.
+- Rename the prompting skill to `gpt-6-2-astra-prompting` and align it with the GPT-6.2 guidance: no plan-only stops, stated assumptions, explicit test policy, self-contained answers, same model on resume.
+- Tell task threads to keep working past plan-only stops and to write self-contained final answers.
+
 ## 1.1.0
 
 - Default to Astra/ultra with per-thread context, compaction and runtime budgets; report observed context separately.

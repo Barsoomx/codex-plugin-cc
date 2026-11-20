@@ -1,6 +1,6 @@
 # Codex prompt antipatterns
 
-Use these examples when a rescue or review prompt causes Astra to stall, guess, overtest, or widen its scope.
+Use these examples when a rescue or review prompt causes GPT-6.2 Astra to stall, guess, overtest, or widen its scope.
 
 ## Vague task framing
 
@@ -51,6 +51,76 @@ Ask only when the missing detail changes correctness, safety, or an irreversible
 If blocked, name the exact missing input and continue no further than the evidence allows.
 </default_follow_through_policy>
 ```
+
+## Ending with a plan instead of the work
+
+Bad:
+
+```text
+Figure out how to fix the flaky retry test.
+```
+
+Better:
+
+```xml
+<task>
+Fix the flaky retry test and leave the suite passing for that file.
+</task>
+
+<default_follow_through_policy>
+Do not end the turn with a plan, an offer, or a routine question while an authorized next step remains.
+Make reasonable reversible assumptions and state them.
+</default_follow_through_policy>
+```
+
+## Stacked brevity instructions
+
+Bad:
+
+```text
+Be extremely concise. Use as few words as possible. No explanations.
+```
+
+Better:
+
+```xml
+<compact_output_contract>
+Keep the final answer outcome-based and self-contained.
+Do not carry over shorthand from reasoning, tool calls, or progress updates.
+</compact_output_contract>
+```
+
+## Implicit test policy
+
+Bad:
+
+```text
+Implement the fix.
+```
+
+Better:
+
+```xml
+<coding_conventions>
+Test policy: write a failing regression test first, then the fix.
+</coding_conventions>
+```
+
+## Switching models on resume
+
+Bad:
+
+```text
+--resume <thread-id> --model luna
+```
+
+Better:
+
+```text
+--fresh --model luna
+```
+
+A model change or downgrade on resume drops the thread's reasoning items. Resume with the original model and effort, or start fresh.
 
 ## Generic prelude or brainstorming gate
 

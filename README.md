@@ -4,7 +4,7 @@ This fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc)
 
 ## Install in WSL
 
-Use native Linux Node.js (18.18+) and a current native Codex CLI. Astra was verified with Codex 0.154.0 and the existing ChatGPT login.
+Use native Linux Node.js (18.18+) and a current native Codex CLI. GPT-6.2 Astra needs Codex 0.171.0 or newer; it was verified with Codex 0.171.0 and the existing ChatGPT login.
 
 ```bash
 claude plugin marketplace add Barsoomx/codex-plugin-cc
@@ -26,7 +26,7 @@ Claude caches plugin versions: a source edit alone does not update the installed
 
 | Setting | Default |
 |---|---|
-| Model / reasoning | `gpt-6-astra` / `ultra` |
+| Model / reasoning | `gpt-6.2-astra` / `ultra` |
 | Requested context / compaction | 1,000,000 / 800,000 tokens |
 | Turn / job deadline | 10,800,000 ms / 3 hours each |
 | Codex agent job budget | 9,600 seconds |
@@ -83,7 +83,7 @@ Claude command wrappers write a JSON array of argument strings using the Write t
 
 Other commands: `/codex:setup` checks runtime/auth; `/codex:transfer` imports a Claude transcript; `/codex:status`, `/codex:result`, `/codex:cancel` manage jobs. The optional stop review gate remains off by default.
 
-Prompts follow [Astra guidance](https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra.md), with bounded tasks, concise evidence, follow-through and no unsolicited delegation. See the [fork/issue audit](docs/FORK-AUDIT.md).
+Prompts follow [GPT-6.2 Astra guidance](https://developers.openai.com/api/docs/guides/latest-model/gpt-6.2-astra.md), with bounded tasks, self-contained evidence, follow-through without plan-only stops, explicit test policy and no unsolicited delegation. See the [fork/issue audit](docs/FORK-AUDIT.md).
 
 ## Development
 

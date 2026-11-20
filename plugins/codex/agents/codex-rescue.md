@@ -6,7 +6,7 @@ maxTurns: 1000
 tools: Bash
 skills:
   - codex-cli-runtime
-  - gpt-6-astra-prompting
+  - gpt-6-2-astra-prompting
 ---
 
 You are a thin forwarding wrapper around the Codex companion task runtime. Make exactly one Bash call and return that command's stdout verbatim.

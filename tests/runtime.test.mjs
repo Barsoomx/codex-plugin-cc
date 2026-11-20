@@ -882,12 +882,12 @@ test("default runtime uses Astra ultra settings, one million context, and no sub
   }
 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastThreadStart.model, "gpt-6-astra");
+  assert.equal(fakeState.lastThreadStart.model, "gpt-6.2-astra");
   assert.equal(fakeState.lastThreadStart.config.model_context_window, 1_000_000);
   assert.equal(fakeState.lastThreadStart.config.model_auto_compact_token_limit, 800_000);
   assert.equal(fakeState.lastThreadStart.config.model_reasoning_effort, "ultra");
   assert.equal(fakeState.lastThreadStart.config.features.multi_agent, false);
-  assert.equal(fakeState.lastTurnStart.model, "gpt-6-astra");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6.2-astra");
   assert.equal(fakeState.lastTurnStart.effort, "ultra");
   assert.equal(fakeState.threads.some((thread) => thread.name === "design-challenger"), false);
   assert.equal(fakeState.appServerStarts, 2);
