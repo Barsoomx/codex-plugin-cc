@@ -101,7 +101,7 @@ test("rescue agent only forwards the parent's concrete args file", () => {
   assert.match(source, /maxTurns: 1000/);
   assert.match(source, /tools: Bash/);
   assert.match(source, /codex-cli-runtime/);
-  assert.match(source, /gpt-6-astra-prompting/);
+  assert.match(source, /gpt-6-2-astra-prompting/);
   assert.match(source, /exactly one Bash call/i);
   assert.match(source, /concrete absolute plugin root and.*absolute JSON args-file path/i);
   assert.match(source, /Do not reconstruct them from environment variables/i);
@@ -136,7 +136,7 @@ test("runtime skill documents args-file forwarding and runtime defaults", () => 
   assert.match(source, /--resume <thread-id>/);
   assert.match(source, /--resume-last/);
   assert.match(source, /--fresh/);
-  assert.match(source, /gpt-6-astra.*ultra/i);
+  assert.match(source, /gpt-6\.2-astra.*ultra/i);
   assert.match(source, /context-window 1000000/);
   assert.match(source, /auto-compact-token-limit 800000/);
   assert.match(source, /turn-timeout-ms 10800000/);

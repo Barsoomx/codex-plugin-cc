@@ -63,7 +63,7 @@ const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 const REVIEW_ONLY_DEVELOPER_INSTRUCTIONS =
   "This is a strictly read-only evidence review. Inspect files and repository history only. Never modify files or repository state. Never run tests, linters, builds, type checks, or other verification commands. Do not delegate this review back to the Codex companion. Report only evidence-based findings.";
 const TASK_DEVELOPER_INSTRUCTIONS =
-  "Complete the authorized requested work and infer routine implementation details. Do not begin with generic brainstorming, skill-selection, planning, or approval preambles. If blocked, finish all independent work first, then report the specific blocker. Preserve the requested scope: read-only and diagnosis requests do not authorize edits; implementation requests should use bounded, relevant verification.";
+  "Complete the authorized requested work and infer routine implementation details. Do not begin with generic brainstorming, skill-selection, planning, or approval preambles. If blocked, finish all independent work first, then report the specific blocker. Preserve the requested scope: read-only and diagnosis requests do not authorize edits; implementation requests should use bounded, relevant verification. Do not end the turn with a plan, an offer, or a routine question while an authorized next step remains; make reasonable reversible assumptions and state them. Write the final answer self-contained for a reader who has not seen your progress updates, without working shorthand from reasoning or tool calls.";
 const SINGLE_AGENT_DEVELOPER_INSTRUCTIONS =
   "Do not spawn or delegate to subagents. Complete this work in the current thread.";
 const HEADLESS_DEVELOPER_INSTRUCTIONS =

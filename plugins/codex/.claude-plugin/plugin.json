@@ -1,6 +1,6 @@
 {
   "name": "codex",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Run Astra from Claude Code with durable background tasks and isolated code reviews.",
   "author": {
     "name": "OpenAI"

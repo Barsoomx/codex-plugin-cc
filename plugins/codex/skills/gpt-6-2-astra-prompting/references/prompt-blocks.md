@@ -19,7 +19,8 @@ Describe the concrete job, repository scope, relevant failure context, and expec
 ```xml
 <structured_output_contract>
 Return exactly the requested shape and nothing else.
-Keep it concise and put the highest-value evidence first.
+Put the highest-value evidence first.
+Make the answer self-contained: do not carry over shorthand from reasoning, tool calls, or progress updates.
 </structured_output_contract>
 ```
 
@@ -27,7 +28,7 @@ Keep it concise and put the highest-value evidence first.
 
 ```xml
 <compact_output_contract>
-Keep the final answer concise and outcome-based.
+Keep the final answer outcome-based and self-contained.
 Include the concrete blocker when the available evidence cannot support completion.
 </compact_output_contract>
 ```
@@ -37,9 +38,22 @@ Include the concrete blocker when the available evidence cannot support completi
 ```xml
 <default_follow_through_policy>
 Continue through all authorized work that is independent of missing details.
+Do not end the turn with a plan, an offer, or a routine question while an authorized next step remains.
+Make reasonable reversible assumptions and state them.
 Ask only when the missing detail changes correctness, safety, or an irreversible action.
 If blocked, name the exact missing input, the evidence already checked, and the consequence.
 </default_follow_through_policy>
+```
+
+### `coding_conventions`
+
+```xml
+<coding_conventions>
+Follow the stated repository conventions for structure, naming, and scope.
+Reuse existing classes, methods, and APIs when they preserve correctness; keep the behavior callers rely on.
+Add tests only as the stated test policy requires; state that policy explicitly when the repository is test-first.
+Keep the code readable; avoid dense one-liners and unnecessary helpers or abstraction layers.
+</coding_conventions>
 ```
 
 ### `completeness_contract`

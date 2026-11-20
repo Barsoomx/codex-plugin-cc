@@ -1,4 +1,5 @@
-const DEFAULT_MODEL = "gpt-6-astra";
+const DEFAULT_MODEL = "gpt-6.2-astra";
+const ASTRA_MODELS = new Set([DEFAULT_MODEL, "gpt-6-astra"]);
 const DEFAULT_ASTRA_EFFORT = "ultra";
 const DEFAULT_ASTRA_CONTEXT_WINDOW = 1_000_000;
 const DEFAULT_ASTRA_AUTO_COMPACT_TOKEN_LIMIT = 800_000;
@@ -42,7 +43,7 @@ function normalizeModel(value) {
 
 function normalizeEffort(value, model) {
   if (!isPresent(value)) {
-    return model === DEFAULT_MODEL ? DEFAULT_ASTRA_EFFORT : null;
+    return ASTRA_MODELS.has(model) ? DEFAULT_ASTRA_EFFORT : null;
   }
   const effort = String(value).trim().toLowerCase();
   if (!VALID_REASONING_EFFORTS.has(effort)) {
@@ -50,9 +51,9 @@ function normalizeEffort(value, model) {
       `Unsupported reasoning effort "${value}". Use one of: none, minimal, low, medium, high, xhigh, max, ultra.`
     );
   }
-  if (model === DEFAULT_MODEL && UNSUPPORTED_ASTRA_EFFORTS.has(effort)) {
+  if (ASTRA_MODELS.has(model) && UNSUPPORTED_ASTRA_EFFORTS.has(effort)) {
     throw new Error(
-      `GPT-6 Astra does not support reasoning effort "${effort}". Use low, medium, high, xhigh, max, or ultra.`
+      `${model} does not support reasoning effort "${effort}". Use low, medium, high, xhigh, max, or ultra.`
     );
   }
   return effort;
@@ -97,7 +98,7 @@ function normalizeBoolean(value, label, fallback = false) {
 export function resolveRuntimeSettings(options = {}) {
   const env = options.env ?? process.env;
   const model = normalizeModel(optionOrEnv(options.model, env, "CODEX_COMPANION_MODEL"));
-  const isAstra = model === DEFAULT_MODEL;
+  const isAstra = ASTRA_MODELS.has(model);
   const effort = normalizeEffort(
     optionOrEnv(options.effort, env, "CODEX_COMPANION_EFFORT"),
     model
